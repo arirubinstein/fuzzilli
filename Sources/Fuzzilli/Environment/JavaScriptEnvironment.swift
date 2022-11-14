@@ -91,6 +91,7 @@ public class JavaScriptEnvironment: ComponentBase, Environment {
         registerObjectGroup(.jsPlainObjects)
         registerObjectGroup(.jsArrays)
         registerObjectGroup(.jsPromises)
+        registerObjectGroup(.jsCompartments)
         registerObjectGroup(.jsRegExps)
         registerObjectGroup(.jsFunctions)
         registerObjectGroup(.jsSymbols)
@@ -109,6 +110,7 @@ public class JavaScriptEnvironment: ComponentBase, Environment {
 
         registerObjectGroup(.jsObjectConstructor)
         registerObjectGroup(.jsPromiseConstructor)
+        registerObjectGroup(.jsCompartmentConstructor)
         registerObjectGroup(.jsArrayConstructor)
         registerObjectGroup(.jsStringConstructor)
         registerObjectGroup(.jsSymbolConstructor)
@@ -154,6 +156,7 @@ public class JavaScriptEnvironment: ComponentBase, Environment {
         registerBuiltin("DataView", ofType: .jsDataViewConstructor)
         registerBuiltin("Date", ofType: .jsDateConstructor)
         registerBuiltin("Promise", ofType: .jsPromiseConstructor)
+        registerBuiltin("Compartment", ofType: .jsCompartmentConstructor)
         registerBuiltin("Proxy", ofType: .jsProxyConstructor)
         registerBuiltin("Map", ofType: .jsMapConstructor)
         registerBuiltin("WeakMap", ofType: .jsWeakMapConstructor)
@@ -329,6 +332,9 @@ public extension JSType {
     /// Type of a JavaScript Promise object.
     static let jsPromise = JSType.object(ofGroup: "Promise", withProperties: ["__proto__", "constructor"], withMethods: ["catch", "finally", "then"])
 
+    /// Type of a JavaScript Compartment object.
+    static let jsCompartment = JSType.object(ofGroup: "Compartment", withProperties: ["__proto__", "constructor", "globalThis"], withMethods: ["evaluate", "import", "importNow", "module"])
+
     /// Type of a JavaScript WeakMap object.
     static let jsWeakMap = JSType.object(ofGroup: "WeakMap", withProperties: ["__proto__"], withMethods: ["delete", "get", "has", "set"])
 
@@ -345,7 +351,7 @@ public extension JSType {
     static let jsFinalizationRegistry = JSType.object(ofGroup: "FinalizationRegistry", withProperties: ["__proto__"], withMethods: ["register", "unregister"])
 
     /// Type of a JavaScript ArrayBuffer object.
-    static let jsArrayBuffer = JSType.object(ofGroup: "ArrayBuffer", withProperties: ["__proto__", "byteLength", "maxByteLength", "resizable"], withMethods: ["resize", "slice", "transfer"])
+    static let jsArrayBuffer = JSType.object(ofGroup: "ArrayBuffer", withProperties: ["__proto__", "byteLength", "maxByteLength", "resizable"], withMethods: ["concat", "resize", "slice", "transfer"])
 
     /// Type of a JavaScript SharedArrayBuffer object.
     static let jsSharedArrayBuffer = JSType.object(ofGroup: "SharedArrayBuffer", withProperties: ["__proto__", "byteLength", "maxByteLength", "growable"], withMethods: ["grow", "slice"])
@@ -374,7 +380,7 @@ public extension JSType {
     static let jsFunctionConstructor = JSType.constructor([.string] => .jsFunction(Signature.forUnknownFunction))
 
     /// Type of the JavaScript String constructor builtin.
-    static let jsStringConstructor = JSType.functionAndConstructor([.anything] => .jsString) + .object(ofGroup: "StringConstructor", withProperties: ["prototype"], withMethods: ["fromCharCode", "fromCodePoint", "raw"])
+    static let jsStringConstructor = JSType.functionAndConstructor([.anything] => .jsString) + .object(ofGroup: "StringConstructor", withProperties: ["prototype"], withMethods: ["fromArrayBuffer", "fromCharCode", "fromCodePoint", "raw"])
 
     /// Type of the JavaScript Boolean constructor builtin.
     static let jsBooleanConstructor = JSType.functionAndConstructor([.anything] => .boolean) + .object(ofGroup: "BooleanConstructor", withProperties: ["prototype"], withMethods: [])
@@ -386,7 +392,7 @@ public extension JSType {
     static let jsSymbolConstructor = JSType.function([.string] => .jsSymbol) + .object(ofGroup: "SymbolConstructor", withProperties: ["iterator", "asyncIterator", "match", "matchAll", "replace", "search", "split", "hasInstance", "isConcatSpreadable", "unscopables", "species", "toPrimitive", "toStringTag"], withMethods: ["for", "keyFor"])
 
     /// Type of the JavaScript BigInt constructor builtin.
-    static let jsBigIntConstructor = JSType.function([.number] => .bigint) + .object(ofGroup: "BigIntConstructor", withProperties: ["prototype"], withMethods: ["asIntN", "asUintN"])
+    static let jsBigIntConstructor = JSType.function([.number] => .bigint) + .object(ofGroup: "BigIntConstructor", withProperties: ["prototype"], withMethods: ["asIntN", "asUintN", "bitLength", "fromArrayBuffer"])
 
     /// Type of the JavaScript RegExp constructor builtin.
     static let jsRegExpConstructor = JSType.jsFunction([.string] => .jsRegExp)
@@ -402,7 +408,7 @@ public extension JSType {
     }
 
     /// Type of the JavaScript ArrayBuffer constructor builtin.
-    static let jsArrayBufferConstructor = JSType.constructor([.integer, .opt(.object())] => .jsArrayBuffer) + .object(ofGroup: "ArrayBufferConstructor", withProperties: ["prototype"], withMethods: ["isView"])
+    static let jsArrayBufferConstructor = JSType.constructor([.integer, .opt(.object())] => .jsArrayBuffer) + .object(ofGroup: "ArrayBufferConstructor", withProperties: ["prototype"], withMethods: ["isView", "fromBigInt", "fromString"])
 
     /// Type of the JavaScript SharedArrayBuffer constructor builtin.
     static let jsSharedArrayBufferConstructor = JSType.constructor([.integer, .opt(.object())] => .jsSharedArrayBuffer) + .object(ofGroup: "SharedArrayBufferConstructor", withProperties: ["prototype"], withMethods: [])
@@ -418,6 +424,9 @@ public extension JSType {
 
     /// Type of the JavaScript Promise constructor builtin.
     static let jsPromiseConstructor = JSType.constructor([.function()] => .jsPromise) + .object(ofGroup: "PromiseConstructor", withProperties: ["prototype"], withMethods: ["resolve", "reject", "all", "any", "race", "allSettled"])
+
+    /// Type of the JavaScript Compartment constructor builtin.
+    static let jsCompartmentConstructor = JSType.constructor([.function()] => .jsCompartment) + .object(ofGroup: "CompartmentConstructor", withProperties: ["prototype"], withMethods: [])
 
     /// Type of the JavaScript Proxy constructor builtin.
     static let jsProxyConstructor = JSType.constructor([.object(), .object()] => .unknown)
@@ -441,7 +450,7 @@ public extension JSType {
     static let jsFinalizationRegistryConstructor = JSType.constructor([.function()] => .jsFinalizationRegistry)
 
     /// Type of the JavaScript Math constructor builtin.
-    static let jsMathObject = JSType.object(ofGroup: "Math", withProperties: ["E", "PI"], withMethods: ["abs", "acos", "acosh", "asin", "asinh", "atan", "atanh", "atan2", "ceil", "cbrt", "expm1", "clz32", "cos", "cosh", "exp", "floor", "fround", "hypot", "imul", "log", "log1p", "log2", "log10", "max", "min", "pow", "random", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh", "trunc"])
+    static let jsMathObject = JSType.object(ofGroup: "Math", withProperties: ["E", "PI"], withMethods: ["abs", "acos", "acosh", "asin", "asinh", "atan", "atanh", "atan2", "ceil", "cbrt", "expm1", "clz32", "cos", "cosh", "exp", "floor", "fround", "hypot", "idiv", "idivmod", "imod", "imul", "imuldiv", "irem", "log", "log1p", "log2", "log10", "max", "min", "pow", "random", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh", "trunc"])
 
     /// Type of the JavaScript Date object
     static let jsDate = JSType.object(ofGroup: "Date", withProperties: ["__proto__", "constructor"], withMethods: ["toISOString", "toDateString", "toTimeString", "toLocaleString", "getTime", "getFullYear", "getUTCFullYear", "getMonth", "getUTCMonth", "getDate", "getUTCDate", "getDay", "getUTCDay", "getHours", "getUTCHours", "getMinutes", "getUTCMinutes", "getSeconds", "getUTCSeconds", "getMilliseconds", "getUTCMilliseconds", "getTimezoneOffset", "getYear", "now", "setTime", "setMilliseconds", "setUTCMilliseconds", "setSeconds", "setUTCSeconds", "setMinutes", "setUTCMinutes", "setHours", "setUTCHours", "setDate", "setUTCDate", "setMonth", "setUTCMonth", "setFullYear", "setUTCFullYear", "setYear", "toJSON", "toUTCString", "toGMTString"])
@@ -592,6 +601,23 @@ public extension ObjectGroup {
             "catch"   : [.function()] => .jsPromise,
             "then"    : [.function()] => .jsPromise,
             "finally" : [.function()] => .jsPromise,
+        ]
+    )
+
+    /// Object group modelling JavaScript compartments.
+    static let jsCompartments = ObjectGroup(
+        name: "Compartment",
+        instanceType: .jsCompartment,
+        properties: [
+            "__proto__"   : .object(),
+            "constructor" : .jsFunction(),      // arguments!
+            "globalThis"  : .object(),
+        ],
+        methods: [  // import/importNow can accept more than strings
+            "import"    : [.string] => .jsPromise,
+            "importNow" : [.string] => .unknown,
+            "module"    : [.opt(.string)] => .object(),
+            "evaluate"  : [.string] => .unknown,
         ]
     )
 
@@ -777,6 +803,7 @@ public extension ObjectGroup {
             "resizable"     : .boolean
         ],
         methods: [
+            "concat"    : [.jsArrayBuffer...] => .jsArrayBuffer,
             "resize"    : [.integer] => .undefined,
             "slice"     : [.integer, .opt(.integer)] => .jsArrayBuffer,
             "transfer"  : [] => .jsArrayBuffer,
@@ -889,6 +916,16 @@ public extension ObjectGroup {
             "race"       : [.jsPromise...] => .jsPromise,
             "allSettled" : [.jsPromise...] => .jsPromise,
         ]
+    )
+
+    /// ObjectGroup modelling the JavaScript Compartment constructor builtin
+    static let jsCompartmentConstructor = ObjectGroup(
+        name: "CompartmentConstructor",
+        instanceType: .jsCompartmentConstructor,
+        properties: [
+            "prototype" : .object()
+        ],
+        methods: [:]
     )
 
     /// ObjectGroup modelling JavaScript Date objects
@@ -1015,7 +1052,9 @@ public extension ObjectGroup {
             "prototype" : .object()
         ],
         methods: [
-            "isView" : [.anything] => .boolean
+            "isView" : [.anything] => .boolean,
+            "fromString" : [.string] => .jsArrayBuffer,
+            "fromBigInt" : [.bigint] => .jsArrayBuffer,
         ]
     )
 
@@ -1036,6 +1075,7 @@ public extension ObjectGroup {
             "prototype" : .object()
         ],
         methods: [
+            "fromArrayBuffer": [.object(ofGroup: "ArrayBuffer")] => .jsString,
             "fromCharCode"  : [.anything...] => .jsString,
             "fromCodePoint" : [.anything...] => .jsString,
             "raw"           : [.anything...] => .jsString
@@ -1077,6 +1117,8 @@ public extension ObjectGroup {
         methods: [
             "asIntN"  : [.number, .bigint] => .bigint,
             "asUintN" : [.number, .bigint] => .bigint,
+            "bitLength"       : [.bigint] => .integer,
+            "fromArrayBuffer" : [.object(ofGroup: "ArrayBuffer")] => .bigint,
         ]
     )
 
@@ -1140,7 +1182,12 @@ public extension ObjectGroup {
             "floor"  : [.anything] => .number,
             "fround" : [.anything] => .number,
             "hypot"  : [.anything...] => .number,
+            "idiv"   : [.anything, .anything] => .integer,
+            "idivmod"   : [.anything, .anything] => .integer,
+            "imod"   : [.anything, .anything] => .integer,
             "imul"   : [.anything, .anything] => .integer,
+            "imuldiv"   : [.anything, .anything, .anything] => .integer,
+            "irem"   : [.anything, .anything] => .integer,
             "log"    : [.anything] => .number,
             "log1p"  : [.anything] => .number,
             "log10"  : [.anything] => .number,
