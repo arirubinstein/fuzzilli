@@ -27,7 +27,7 @@ import Foundation
 ///   (e.g. load a property, call a method, ...). At the end or program execution, all these "actions"
 ///   are reported back to Fuzzilli through the special FUZZOUT channel.
 /// 3. The mutator processes the output of step 2 and replaces all successful Explore operations with the concrete
-///   action that was performed by them at runtime (so for example a LoadProperty or CallMethod operation)
+///   action that was performed by them at runtime (so for example a GetProperty or CallMethod operation)
 ///
 /// The result is a program that performs useful actions on some of the existing variables even without
 /// statically knowing their type. The resulting program is also deterministic and "JIT friendly" as it
@@ -39,7 +39,6 @@ public class ExplorationMutator: Mutator {
     private let logger = Logger(withLabel: "ExplorationMutator")
 
     // If true, this mutator will log detailed statistics like how often each type of operation was performend.
-    // Enable verbose mode by default while this feature is still under development.
     private let verbose = true
 
     // How often each of the available handlers was invoked, used only in verbose mode.
@@ -178,18 +177,18 @@ public class ExplorationMutator: Mutator {
         producedSamples += 1
         if verbose && (producedSamples % 1000) == 0 {
             let totalHandlerInvocations = invocationCountsPerHandler.values.reduce(0, +)
-            logger.info("Frequencies of generated operations:")
+            logger.verbose("Frequencies of generated operations:")
             for (op, count) in invocationCountsPerHandler {
                 let frequency = (Double(count) / Double(totalHandlerInvocations)) * 100.0
-                logger.info("    \(op.rightPadded(toLength: 30)): \(String(format: "%.2f%%", frequency))")
+                logger.verbose("    \(op.rightPadded(toLength: 30)): \(String(format: "%.2f%%", frequency))")
             }
 
             let totalOutcomes = explorationOutcomeCounts.values.reduce(0, +)
-            logger.info("Frequencies of exploration outcomes:")
+            logger.verbose("Frequencies of exploration outcomes:")
             for outcome in ExplorationOutcome.allCases {
                 let count = explorationOutcomeCounts[outcome]!
                 let frequency = (Double(count) / Double(totalOutcomes)) * 100.0
-                logger.info("    \(outcome.rawValue.rightPadded(toLength: 30)): \(String(format: "%.2f%%", frequency))")
+                logger.verbose("    \(outcome.rawValue.rightPadded(toLength: 30)): \(String(format: "%.2f%%", frequency))")
             }
         }
 
@@ -200,15 +199,17 @@ public class ExplorationMutator: Mutator {
     private func instrument(_ program: Program, for fuzzer: Fuzzer) -> (instrumentedProgram: Program, exploreIds: [String])? {
         let b = fuzzer.makeBuilder()
 
-        // Enumerate all variables in the program in put them into one of two buckets, depending on whether static type information is available for them.
+        // Enumerate all variables in the program and put them into one of two buckets, depending on whether static type information is available for them.
         var untypedVariables = [Variable]()
         var typedVariables = [Variable]()
         for instr in program.code {
             b.append(instr)
+
             // Since we need additional arguments for Explore, only explore when we have a couple of visible variables.
             guard b.numVisibleVariables > 3 else { continue }
+
             for v in instr.allOutputs {
-                if b.type(of: v) == .unknown {
+                if b.type(of: v) == .unknown || b.type(of: v) == .unknownObject {
                     untypedVariables.append(v)
                 } else {
                     typedVariables.append(v)
@@ -230,18 +231,51 @@ public class ExplorationMutator: Mutator {
         // Finally construct the instrumented program that contains the Explore operations.
         b.reset()
         var ids = [String]()
+        // Helper function for inserting the Explore operation and tracking its id.
+        func explore(_ v: Variable) {
+            let args = b.randomVariables(upTo: 5)
+            assert(args.count > 0)
+            let id = String(v.number)
+            assert(!ids.contains(id))
+            b.explore(v, id: id, withArgs: args)
+            ids.append(id)
+        }
+        // When we want to explore the (outer) output of a block (e.g. a function or a class), we only want to perform the
+        // explore operation after the block has been closed, and not inside the block (for functions, because that'll quickly
+        // lead to unchecked recursion, for classes because we don't have .javascript context in the class body, and in
+        // general because it's probably not what makes sense semantically).
+        // For that reason, we keep a stack of variables that still need to be explored. A variable in that stack is explored
+        // when its entry is popped from the stack, which happens when the block end instruction is emitted.
+        var pendingExploreStack = Stack<Variable?>()
         b.adopting(from: program) {
             for instr in program.code {
                 b.adopt(instr)
-                for v in instr.allOutputs {
-                    if variablesToExplore.contains(v) {
-                        let args = b.randVars(upTo: 5)
-                        assert(args.count > 0)
-                        let id = v.identifier
-                        assert(!ids.contains(id))
-                        b.explore(v, id: id, withArgs: args)
-                        ids.append(id)
+
+                if instr.isBlockGroupStart {
+                    // Will be replaced with a variable if one needs to be explored.
+                    pendingExploreStack.push(nil)
+                } else if instr.isBlockGroupEnd {
+                    // Emit pending explore operation if any.
+                    if let v = pendingExploreStack.pop() {
+                        explore(v)
                     }
+                }
+
+                for v in instr.outputs where variablesToExplore.contains(v) {
+                    // When the current instruction starts a new block, we defer exploration until after that block is closed.
+                    if instr.isBlockStart {
+                        // Currently we assume that inner block instructions don't have (outer) outputs. If they ever do, this logic probably needs to be revisited.
+                        assert(instr.isBlockGroupStart)
+                        // We currently assume that there can only be one such pending variable. If there are ever multiple ones, the stack simply needs to keep a list of Variables instead of a single one.
+                        assert(pendingExploreStack.top == nil)
+                        pendingExploreStack.top = v
+                    } else {
+                        explore(v)
+                    }
+                }
+                for v in instr.innerOutputs where variablesToExplore.contains(v) {
+                    // We always immediately explore inner outputs
+                    explore(v)
                 }
             }
         }
@@ -255,7 +289,13 @@ public class ExplorationMutator: Mutator {
         }
 
         if verbose { invocationCountsPerHandler[action.operation]! += 1 }
-        handler.invoke(for: action, on: exploredValue, withArgs: arguments, using: b, loggingWith: logger)
+        if action.isFallible {
+            b.buildTryCatchFinally(tryBody: {
+                handler.invoke(for: action, on: exploredValue, withArgs: arguments, using: b, loggingWith: logger)
+            }, catchBody: { _ in })
+        } else {
+            handler.invoke(for: action, on: exploredValue, withArgs: arguments, using: b, loggingWith: logger)
+        }
     }
 
     // Data structure used for communication with the target. Will be transmitted in JSON-encoded form.
@@ -287,6 +327,7 @@ public class ExplorationMutator: Mutator {
         let id: String
         let operation: String
         let inputs: [Input]
+        let isFallible: Bool
     }
 
     // Handlers to interpret the actions and translate them into FuzzIL instructions.
@@ -393,14 +434,14 @@ public class ExplorationMutator: Mutator {
         "CONSTRUCT": Handler { b, v, inputs in b.construct(v, withArgs: inputs) },
         "CALL_METHOD": Handler.withMethodName { b, v, methodName, inputs in b.callMethod(methodName, on: v, withArgs: inputs) },
         "CONSTRUCT_MEMBER": Handler.withMethodName { b, v, constructorName, inputs in
-            let constructor = b.loadProperty(constructorName, of: v)
+            let constructor = b.getProperty(constructorName, of: v)
             b.construct(constructor, withArgs: inputs)
         },
-        "GET_PROPERTY": Handler.withPropertyName(expectedInputs: 0) { b, v, propertyName, inputs in b.loadProperty(propertyName, of: v) },
-        "SET_PROPERTY": Handler.withPropertyName(expectedInputs: 1) { b, v, propertyName, inputs in b.storeProperty(inputs[0], as: propertyName, on: v) },
-        "DEFINE_PROPERTY": Handler.withPropertyName(expectedInputs: 1) { b, v, propertyName, inputs in b.storeProperty(inputs[0], as: propertyName, on: v) },
-        "GET_ELEMENT": Handler.withElementIndex(expectedInputs: 0) { b, v, idx, inputs in b.loadElement(idx, of: v) },
-        "SET_ELEMENT": Handler.withElementIndex(expectedInputs: 1) { b, v, idx, inputs in b.storeElement(inputs[0], at: idx, of: v) },
+        "GET_PROPERTY": Handler.withPropertyName(expectedInputs: 0) { b, v, propertyName, inputs in b.getProperty(propertyName, of: v) },
+        "SET_PROPERTY": Handler.withPropertyName(expectedInputs: 1) { b, v, propertyName, inputs in b.setProperty(propertyName, of: v, to: inputs[0]) },
+        "DEFINE_PROPERTY": Handler.withPropertyName(expectedInputs: 1) { b, v, propertyName, inputs in b.setProperty(propertyName, of: v, to: inputs[0]) },
+        "GET_ELEMENT": Handler.withElementIndex(expectedInputs: 0) { b, v, idx, inputs in b.getElement(idx, of: v) },
+        "SET_ELEMENT": Handler.withElementIndex(expectedInputs: 1) { b, v, idx, inputs in b.setElement(idx, of: v, to: inputs[0]) },
         "ADD": Handler(expectedInputs: 1) { b, v, inputs in b.binary(v, inputs[0], with: .Add) },
         "SUB": Handler(expectedInputs: 1) { b, v, inputs in b.binary(v, inputs[0], with: .Sub) },
         "MUL": Handler(expectedInputs: 1) { b, v, inputs in b.binary(v, inputs[0], with: .Mul) },
@@ -437,7 +478,7 @@ public class ExplorationMutator: Mutator {
         },
         "SYMBOL_REGISTRATION": Handler(expectedInputs: 0) { b, v, inputs in
             let Symbol = b.reuseOrLoadBuiltin("Symbol")
-            let description = b.loadProperty("description", of: v)
+            let description = b.getProperty("description", of: v)
             b.callMethod("for", on: Symbol, withArgs: [description])
         },
     ]

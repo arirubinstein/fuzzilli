@@ -50,20 +50,22 @@ public class MutationEngine: ComponentBase, FuzzEngine {
         for _ in 0..<numConsecutiveMutations {
             var mutator = fuzzer.mutators.randomElement()
             var mutated = false
-            for _ in 0..<10 {
-                if let result = mutator.mutate(parent, for: fuzzer) {
-                    program = result
-                    mutated = true
-                    mutator.addedInstructions(program.size - parent.size)
-                    break
+            var attempt = 0
+            let maxAttempts = 10
+            repeat {
+                attempt += 1
+                guard let result = mutator.mutate(parent, for: fuzzer) else {
+                    mutator.failedToGenerate()
+                    mutator = fuzzer.mutators.randomElement()
+                    continue
                 }
-                logger.verbose("\(mutator.name) failed, trying different mutator")
-                mutator.failedToGenerate()
-                mutator = fuzzer.mutators.randomElement()
-            }
+                program = result
+                mutated = true
+                mutator.addedInstructions(program.size - parent.size)
+            } while !mutated && attempt < maxAttempts
 
             if !mutated {
-                logger.warning("Could not mutate sample, giving up. Sample:\n\(fuzzer.lifter.lift(parent))")
+                logger.warning("Could not mutate sample, giving up. Sample:\n\(FuzzILLifter().lift(parent))")
                 continue
             }
 

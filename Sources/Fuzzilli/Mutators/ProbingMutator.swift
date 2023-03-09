@@ -27,7 +27,7 @@ import Foundation
 /// 2. It executes the instrumented program. The program collects the property names of non-existent properties that were accessed
 ///   on a probe and reports this information to Fuzzilli through the FUZZOUT channel at the end of the program's execution.
 /// 3. The mutator processes the output of step 2 and randomly selects properties to install (either as plain value or
-///   accessor). It then converts the Probe operations to an appropriate FuzzIL operation (e.g. StoreProperty).
+///   accessor). It then converts the Probe operations to an appropriate FuzzIL operation (e.g. SetProperty).
 ///
 /// A large bit of the logic of this mutator is located in the lifter code that implements Probe operations
 /// in the target language. For JavaScript, that logic can be found in JavaScriptProbeLifting.swift.
@@ -35,7 +35,6 @@ public class ProbingMutator: Mutator {
     private let logger = Logger(withLabel: "ProbingMutator")
 
     // If true, this mutator will log detailed statistics.
-    // Enable verbose mode by default while this feature is still under development.
     private let verbose = true
 
     // Statistics about how often we've installed a particular property. Printed in regular intervals if verbose mode is active, then reset.
@@ -154,25 +153,25 @@ public class ProbingMutator: Mutator {
         producedSamples += 1
         let N = 1000
         if verbose && (producedSamples % N) == 0 {
-            logger.info("Properties installed during the last \(N) successful runs:")
+            logger.verbose("Properties installed during the last \(N) successful runs:")
             var statsAsList = installedPropertiesForGetAccess.map({ (key: $0, count: $1, op: "get") })
             statsAsList +=   installedPropertiesForSetAccess.map({ (key: $0, count: $1, op: "set") })
             for (key, count, op) in statsAsList.sorted(by: { $0.count > $1.count }) {
                 let type = isCallableProperty(key) ? "function" : "anything"
-                logger.info("    \(count)x \(key.description) (access: \(op), type: \(type))")
+                logger.verbose("    \(count)x \(key.description) (access: \(op), type: \(type))")
             }
-            logger.info("    Total number of properties installed: \(installedPropertyCounter)")
+            logger.verbose("    Total number of properties installed: \(installedPropertyCounter)")
 
             installedPropertiesForGetAccess.removeAll()
             installedPropertiesForSetAccess.removeAll()
             installedPropertyCounter = 0
 
-            logger.info("Frequencies of probing outcomes:")
+            logger.verbose("Frequencies of probing outcomes:")
             let totalOutcomes = probingOutcomeCounts.values.reduce(0, +)
             for outcome in ProbingOutcome.allCases {
                 let count = probingOutcomeCounts[outcome]!
                 let frequency = (Double(count) / Double(totalOutcomes)) * 100.0
-                logger.info("    \(outcome.rawValue.rightPadded(toLength: 30)): \(String(format: "%.2f%%", frequency))")
+                logger.verbose("    \(outcome.rawValue.rightPadded(toLength: 30)): \(String(format: "%.2f%%", frequency))")
             }
         }
 
@@ -216,13 +215,13 @@ public class ProbingMutator: Mutator {
         switch property {
         case .regular(let name):
             assert(name.rangeOfCharacter(from: .whitespacesAndNewlines) == nil)
-            b.storeProperty(value, as: name, on: obj)
+            b.setProperty(name, of: obj, to: value)
         case .element(let index):
-            b.storeElement(value, at: index, of: obj)
+            b.setElement(index, of: obj, to: value)
         case .symbol(let desc):
             let Symbol = b.loadBuiltin("Symbol")
-            let symbol = b.loadProperty(extractSymbolNameFromDescription(desc), of: Symbol)
-            b.storeComputedProperty(value, as: symbol, on: obj)
+            let symbol = b.getProperty(extractSymbolNameFromDescription(desc), of: Symbol)
+            b.setComputedProperty(symbol, of: obj, to: value)
         }
     }
 
@@ -266,7 +265,7 @@ public class ProbingMutator: Mutator {
             b.configureElement(index, of: obj, usingFlags: PropertyFlags.random(), as: config)
         case .symbol(let desc):
             let Symbol = b.loadBuiltin("Symbol")
-            let symbol = b.loadProperty(extractSymbolNameFromDescription(desc), of: Symbol)
+            let symbol = b.getProperty(extractSymbolNameFromDescription(desc), of: Symbol)
             b.configureComputedProperty(symbol, of: obj, usingFlags: PropertyFlags.random(), as: config)
         }
     }
@@ -300,18 +299,18 @@ public class ProbingMutator: Mutator {
         if isCallableProperty(property) {
             // Either create a new function or reuse an existing one
             let probabilityOfReusingExistingFunction = 2.0 / 3.0
-            if let f = b.randVar(ofConservativeType: .function()), probability(probabilityOfReusingExistingFunction) {
+            if let f = b.randomVariable(ofConservativeType: .function()), probability(probabilityOfReusingExistingFunction) {
                 return f
             } else {
                 let f = b.buildPlainFunction(with: .parameters(n: Int.random(in: 0..<3))) { args in
                     b.build(n: 2)       // TODO maybe forbid generating any nested blocks here?
-                    b.doReturn(b.randVar())
+                    b.doReturn(b.randomVariable())
                 }
                 return f
             }
         } else {
             // Otherwise, just return a random variable.
-            return b.randVar()
+            return b.randomVariable()
         }
     }
 
@@ -346,34 +345,33 @@ public class ProbingMutator: Mutator {
         let numVariablesToProbe = Int((Double(candidates.count) * 0.5).rounded(.up))
         let variablesToProbe = VariableSet(candidates.shuffled().prefix(numVariablesToProbe))
 
-        var pendingVariablesToInstrument = [(v: Variable, depth: Int)]()
-        var depth = 0
+        // We only want to instrument outer outputs of block heads after the end of that block.
+        // For example, a function definition should be turned into a probe not inside its body
+        // but right after the function definition ends in the surrounding block.
+        // For that reason, we keep a stack of pending variables that need to be probed once
+        // the block that they are the output of is closed.
+        var pendingProbesStack = Stack<Variable?>()
         let b = fuzzer.makeBuilder()
         b.adopting(from: program) {
             for instr in program.code {
                 b.adopt(instr)
 
-                for v in instr.innerOutputs where variablesToProbe.contains(v) {
-                    b.probe(v, id: v.identifier)
-                }
-                for v in instr.outputs where variablesToProbe.contains(v) {
-                    // We only want to instrument outer outputs of block heads after the end of that block.
-                    // For example, a function definition should be turned into a probe not inside its body
-                    // but right after the function definition ends in the surrounding block.
-                    if instr.isBlockGroupStart {
-                        pendingVariablesToInstrument.append((v, depth))
-                    } else {
-                        b.probe(v, id: v.identifier)
+                if instr.isBlockGroupStart {
+                    pendingProbesStack.push(nil)
+                } else if instr.isBlockGroupEnd {
+                    if let v = pendingProbesStack.pop() {
+                        b.probe(v, id: String(v.number))
                     }
                 }
 
-                if instr.isBlockGroupStart {
-                    depth += 1
-                } else if instr.isBlockGroupEnd {
-                    depth -= 1
-                    while pendingVariablesToInstrument.last?.depth == depth {
-                        let (v, _) = pendingVariablesToInstrument.removeLast()
-                        b.probe(v, id: v.identifier)
+                for v in instr.innerOutputs where variablesToProbe.contains(v) {
+                    b.probe(v, id: String(v.number))
+                }
+                for v in instr.outputs where variablesToProbe.contains(v) {
+                    if instr.isBlockGroupStart {
+                        pendingProbesStack.top = v
+                    } else {
+                        b.probe(v, id: String(v.number))
                     }
                 }
             }

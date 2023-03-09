@@ -41,44 +41,40 @@ struct SimplifyingReducer: Reducer {
         //   - convert strict functions into non-strict functions
         for instr in code {
             var newOp: Operation? = nil
-            switch instr.op {
-            case let op as CreateObjectWithSpread:
-                if op.numSpreads == 0 {
-                    newOp = CreateObject(propertyNames: op.propertyNames)
-                }
-            case let op as CreateArrayWithSpread:
+            switch instr.op.opcode {
+            case .createArrayWithSpread(let op):
                 newOp = CreateArray(numInitialValues: op.numInputs)
-            case let op as CallFunctionWithSpread:
+            case .callFunctionWithSpread(let op):
                 newOp = CallFunction(numArguments: op.numArguments)
-            case let op as ConstructWithSpread:
+            case .constructWithSpread(let op):
                 newOp = Construct(numArguments: op.numArguments)
-            case let op as CallMethodWithSpread:
+            case .callMethodWithSpread(let op):
                 newOp = CallMethod(methodName: op.methodName, numArguments: op.numArguments)
-            case let op as CallComputedMethodWithSpread:
+            case .callComputedMethodWithSpread(let op):
                 newOp = CallComputedMethod(numArguments: op.numArguments)
 
-            case let op as Construct:
+            case .construct(let op):
                 // Prefer simple function calls over constructor calls if there's no difference
                 newOp = CallFunction(numArguments: op.numArguments)
 
             // Prefer non strict functions over strict ones
-            case let op as BeginPlainFunction:
+            case .beginPlainFunction(let op):
                 if op.isStrict {
                     newOp = BeginPlainFunction(parameters: op.parameters, isStrict: false)
                 }
-            case let op as BeginArrowFunction:
+            case .beginArrowFunction(let op):
                 if op.isStrict {
                     newOp = BeginArrowFunction(parameters: op.parameters, isStrict: false)
                 }
-            case let op as BeginGeneratorFunction:
+            case .beginGeneratorFunction(let op):
                 if op.isStrict {
                     newOp = BeginGeneratorFunction(parameters: op.parameters, isStrict: false)
                 }
-            case let op as BeginAsyncFunction:
+            case .beginAsyncFunction(let op):
                 if op.isStrict {
                     newOp = BeginAsyncFunction(parameters: op.parameters, isStrict: false)
                 }
-            case let op as BeginAsyncGeneratorFunction:
+            case .beginAsyncGeneratorFunction(let op):
                 if op.isStrict {
                     newOp = BeginAsyncGeneratorFunction(parameters: op.parameters, isStrict: false)
                 }
@@ -99,21 +95,47 @@ struct SimplifyingReducer: Reducer {
         //  - convert destructuring operations into simple property or element loads
         //
         // All simplifications are performed at once to keep this logic simple.
+        // This logic needs to be somewhat careful not to perform no-op replacements as
+        // these would cause the fixpoint iteration to not terminate.
         var newCode = Code()
         var numCopiedInstructions = 0
         for instr in code {
-            switch instr.op {
-            case let op as DestructObject:
+            var keepInstruction = true
+            switch instr.op.opcode {
+            case .destructObject(let op):
+                guard op.properties.count > 0 else {
+                    // Cannot simplify this as it would be a no-op
+                    break
+                }
+
                 let outputs = Array(instr.outputs)
                 for (i, propertyName) in op.properties.enumerated() {
-                    newCode.append(Instruction(LoadProperty(propertyName: propertyName), output: outputs[i], inputs: [instr.input(0)]))
+                    newCode.append(Instruction(GetProperty(propertyName: propertyName), output: outputs[i], inputs: [instr.input(0)]))
                 }
-            case let op as DestructArray:
+                if op.hasRestElement {
+                    newCode.append(Instruction(DestructObject(properties: [], hasRestElement: true), output: outputs.last!, inputs: [instr.input(0)]))
+                }
+                keepInstruction = false
+            case .destructArray(let op):
+                guard op.indices.count > 1 || !op.lastIsRest else {
+                    // Cannot simplify this as it would be a no-op
+                    break
+                }
+
                 let outputs = Array(instr.outputs)
                 for (i, idx) in op.indices.enumerated() {
-                    newCode.append(Instruction(LoadElement(index: idx), output: outputs[i], inputs: [instr.input(0)]))
+                    if i == op.indices.last! && op.lastIsRest {
+                        newCode.append(Instruction(DestructArray(indices: [idx], lastIsRest: true), output: outputs.last!, inputs: [instr.input(0)]))
+                    } else {
+                        newCode.append(Instruction(GetElement(index: idx), output: outputs[i], inputs: [instr.input(0)]))
+                    }
                 }
+                keepInstruction = false
             default:
+                break
+            }
+
+            if keepInstruction {
                 numCopiedInstructions += 1
                 newCode.append(instr)
             }

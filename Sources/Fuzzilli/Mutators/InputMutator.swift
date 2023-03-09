@@ -47,12 +47,12 @@ public class InputMutator: BaseInstructionMutator {
         // Inputs to block end instructions must be taken from the outer scope since the scope
         // closed by the instruction is currently still active.
         let replacement: Variable
-        if (isTypeAware) {
+        if isTypeAware {
             let type = b.type(of: inouts[selectedInput]).generalize()
             // We are guaranteed to find at least the current input.
-            replacement = b.randVar(ofType: type, excludeInnermostScope: instr.isBlockEnd)!
+            replacement = b.randomVariable(ofType: type)!
         } else {
-            replacement = b.randVar(excludeInnermostScope: instr.isBlockEnd)
+            replacement = b.randomVariable()
         }
         b.trace("Replacing input \(selectedInput) (\(inouts[selectedInput])) with \(replacement)")
         inouts[selectedInput] = replacement

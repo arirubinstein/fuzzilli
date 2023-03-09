@@ -15,6 +15,9 @@
 /// This file contains the JavaScript specific implementation of the Explore operation. See ExplorationMutator.swift for an overview of this feature.
 struct JavaScriptExploreHelper {
     static let prefixCode = """
+    // If a sample with this instrumentation crashes, it may need the `fuzzilli` function to reproduce the crash.
+    if (typeof fuzzilli === 'undefined') fuzzilli = function() {};
+
     const explore = (function() {
         // Note: this code must generally assume that any operation performed on the object to explore, or any object obtained through it (e.g. a prototype), may raise an exception, for example due to triggering a Proxy trap.
         // Further, it must also assume that the environment has been modified arbitrarily. For example, the Array.prototype[@@iterator] may have been set to an invalid value, so using `for...of` syntax could trigger an exception.
@@ -46,7 +49,7 @@ struct JavaScriptExploreHelper {
         const shift = Function.prototype.call.bind(Array.prototype.shift);
         const pop = Function.prototype.call.bind(Array.prototype.pop);
         const push = Function.prototype.call.bind(Array.prototype.push);
-        const match = Function.prototype.call.bind(RegExp.prototype[Symbol.match]);
+        const execRegExp = Function.prototype.call.bind(RegExp.prototype.exec);
         const stringSlice = Function.prototype.call.bind(String.prototype.slice);
         const toUpperCase = Function.prototype.call.bind(String.prototype.toUpperCase);
         const numberToString = Function.prototype.call.bind(Number.prototype.toString);
@@ -238,9 +241,10 @@ struct JavaScriptExploreHelper {
 
         // Helper function to determine if a string is "simple". We only include simple strings for property/method names or string literals.
         // A simple string is basically a valid, property name with a maximum length.
+        const simpleStringRegExp = /^[0-9a-zA-Z_$]+$/;
         function isSimpleString(s) {
             if (!isString(s)) throw "Non-string argument to isSimpleString: " + s;
-            return s.length < 50 && match(/^[0-9a-zA-Z_$]+$/, s);
+            return s.length < 50 && execRegExp(simpleStringRegExp, s) !== null;
         }
 
         // Helper function to determine whether a property can be accessed without raising an exception.
@@ -573,6 +577,25 @@ struct JavaScriptExploreHelper {
         function Action(operation, inputs = EmptyArray()) {
             this.operation = operation;
             this.inputs = inputs;
+            this.isFallible = false;
+        }
+
+        // A fallible action is an action that is allowed to fail, i.e. raise an exception.
+        //
+        // These are used mostly for function/method calls which may throw an exception if
+        // they aren't given the right arguments. In that case, we may still want to keep the
+        // function call so that it can be mutated further to hopefully eventually find the
+        // correct arguments. This is especially true if finding the right arguments reqires
+        // the ProbingMutator to install the right properties on an argument object, in which
+        // case the ExplorationMutator on its own would (likely) never be able to generate a
+        // valid call, and so the function/method may be missed entirely.
+        //
+        // If a fallible action succeeds, it is converted to a regular action to limit the
+        // number of generated try-catch blocks.
+        function FallibleAction(operation, inputs = EmptyArray()) {
+            this.operation = operation;
+            this.inputs = inputs;
+            this.isFallible = true;
         }
 
         // Heuristic to determine when a function should be invoked as a constructor.
@@ -584,8 +607,8 @@ struct JavaScriptExploreHelper {
                 return probability(0.1);
             }
 
-            // If the name is something like `v42`, it's probably a function defined by Fuzzilli. These can typicall be as function or constructor, but prefer to call them as regular functions.
-            if (name[0] === 'v' && !isNaN(parseInteger(stringSlice(name, 1)))) {
+            // If the name is something like `f42`, it's probably a function defined by Fuzzilli. These can typicall be used as function or constructor, but prefer to call them as regular functions.
+            if (name[0] === 'f' && !isNaN(parseInteger(stringSlice(name, 1)))) {
               return probability(0.2);
             }
 
@@ -621,9 +644,9 @@ struct JavaScriptExploreHelper {
                 let inputs = Inputs.randomArguments(numParameters + 1);
                 inputs[0] = input;
                 if (shouldTreatAsConstructor(f)) {
-                  return new Action(OP_CONSTRUCT_MEMBER, inputs);
+                  return new FallibleAction(OP_CONSTRUCT_MEMBER, inputs);
                 } else {
-                  return new Action(OP_CALL_METHOD, inputs);
+                  return new FallibleAction(OP_CALL_METHOD, inputs);
                 }
             } else if (input instanceof ElementIndexInput) {
                 if (probability(0.5)) {
@@ -661,7 +684,7 @@ struct JavaScriptExploreHelper {
                 numParameters = 0;
             }
             let operation = shouldTreatAsConstructor(f) ? OP_CONSTRUCT : OP_CALL_FUNCTION;
-            return new Action(operation, Inputs.randomArguments(numParameters));
+            return new FallibleAction(operation, Inputs.randomArguments(numParameters));
         }
 
         function exploreString(s) {
@@ -834,8 +857,11 @@ struct JavaScriptExploreHelper {
 
             try {
                 handler(v, concreteInputs);
+                // If the action succeeded, mark it as non-fallible so that we don't emit try-catch blocks for it later on.
+                // We could alternatively only do that if all executions succeeded, but it's probably fine to do it if at least one execution succeeded.
+                if (action.isFallible) action.isFallible = false;
             } catch (e) {
-                return false;
+                return action.isFallible;
             }
 
             return true;

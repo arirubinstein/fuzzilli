@@ -37,9 +37,7 @@ public class Fuzzer {
     public let runner: ScriptRunner
 
     /// The fuzzer engine producing new programs from existing ones and executing them.
-    public private(set) var engine: FuzzEngine
-    /// During initial corpus generation, the current engine will be a GenerativeEngine while this will keep a reference to the "real" engine to use after corpus generation.
-    private var nextEngine: FuzzEngine?
+    public let engine: FuzzEngine
 
     /// The active code generators. It is possible to change these (temporarily) at runtime. This is e.g. done by some ProgramTemplates.
     public var codeGenerators: WeightedList<CodeGenerator>
@@ -65,17 +63,53 @@ public class Fuzzer {
     /// The minimizer to shrink programs that cause crashes or trigger new interesting behaviour.
     public let minimizer: Minimizer
 
-    public enum Phase {
-        // Importing and minimizing an existing corpus
+    /// The engine used for initial corpus generation (if performed).
+    public let corpusGenerationEngine = GenerativeEngine()
+
+    /// The possible states of a fuzzer.
+    public enum State {
+        // Initial state of the fuzzer. Will be changed to one of the below states during
+        // initialization.
+        case uninitialized
+
+        // When running as a child node for distributed fuzzing, indicates that we're waiting
+        // for our parent node to send as our initial corpus.
+        // Child nodes remain in this state (and do effectively nothing) until they have
+        // received a corpus (containing at least one program) from their parent node.
+        case waiting
+
+        // Importing and potentially minimizing an existing corpus.
         case corpusImport
-        // When starting with an empty corpus, we will do some initial corpus generation using the GenerativeEngine
-        case initialCorpusGeneration
-        // Regular fuzzing using the configured FuzzEngine
+
+        // Generating an initial corpus. Used when no existing corpus is imported and when
+        // this instance isn't configured to receive a corpus from its parent node.
+        case corpusGeneration
+
+        // Fuzzing with the configured engine.
         case fuzzing
     }
 
-    /// The current phase of the fuzzer
-    public private(set) var phase: Phase = .fuzzing
+    /// The current state of this fuzzer.
+    public private(set) var state: State = .uninitialized
+
+    private func changeState(to newState: State) {
+        logger.info("Changing state from \(state) to \(newState)")
+
+        // Some state transitions are forbidden, check for those here.
+        assert(newState != .uninitialized)      // We never transition into .uninitialized
+        assert(newState != .waiting || state == .uninitialized)     // We're only transitioning into .waiting during initialization
+        assert(state != .fuzzing)   // Currently we never transition out of .fuzzing (although we could allow scheduling a corpus import while already fuzzing)
+
+        state = newState
+    }
+
+    /// Start time of this fuzzing session
+    private let startTime = Date()
+
+    /// Returns the uptime of this fuzzer as TimeInterval.
+    public func uptime() -> TimeInterval {
+        return -startTime.timeIntervalSinceNow
+    }
 
     /// The modules active on this fuzzer.
     var modules = [String: Module]()
@@ -92,10 +126,24 @@ public class Fuzzer {
     /// The logger instance for the main fuzzer.
     private var logger: Logger
 
+    public enum ExitCondition {
+        // Fuzz indefinitely.
+        case none
+        // Fuzz until a specified number of iterations have been performed.
+        case iterationsPerformed(Int)
+        // Fuzz for a specified amount of time.
+        case timeFuzzed(TimeInterval)
+    }
+
+    /// How long to fuzz?
+    private var exitCondition = ExitCondition.none
+
     /// State management.
-    private var maxIterations = -1
     private var iterations = 0
     private var iterationOfLastInteratingSample = 0
+
+    /// Currently active corpus import job, if any.
+    private var currentCorpusImportJob = CorpusImportJob(corpus: [], mode: .full)
 
     private var iterationsSinceLastInterestingProgram: Int {
         assert(iterations >= iterationOfLastInteratingSample)
@@ -169,7 +217,11 @@ public class Fuzzer {
     public func addModule(_ module: Module) {
         assert(!isInitialized)
         assert(modules[module.name] == nil)
+
         modules[module.name] = module
+
+        // We only allow one instance of certain modules.
+        assert(modules.values.filter( { $0 is DistributedFuzzingChildNode }).count <= 1)
     }
 
     /// Initializes this fuzzer.
@@ -190,13 +242,14 @@ public class Fuzzer {
         environment.initialize(with: self)
         corpus.initialize(with: self)
         minimizer.initialize(with: self)
+        corpusGenerationEngine.initialize(with: self)
 
         // Finally initialize all modules.
         for module in modules.values {
             module.initialize(with: self)
         }
 
-        // Install a watchdog to monitor utilization instances.
+        // Install a watchdog to monitor the utilization of this instance.
         var lastCheck = Date()
         timers.scheduleTask(every: 1 * Minutes) {
             // Monitor responsiveness
@@ -208,40 +261,71 @@ public class Fuzzer {
             }
         }
 
+        // Determine our initial state if necessary.
+        assert(state == .uninitialized || state == .corpusImport)
+        if state == .uninitialized {
+            let isChildNode = modules.values.contains(where: { $0 is DistributedFuzzingChildNode })
+            if isChildNode {
+                // We're a child node, so wait until we've received some kind of corpus from our parent node.
+                // We'll change our state when we're synchronized with our parent, see updateStateAfterSynchronizingWithParentNode() below.
+                changeState(to: .waiting)
+            } else {
+                // Start with corpus generation.
+                assert(corpus.isEmpty)
+                changeState(to: .corpusGeneration)
+            }
+        }
+
         dispatchEvent(events.Initialized)
         logger.info("Initialized")
         isInitialized = true
+    }
+
+    /// Determine the new state of this fuzzer after synchronizing with its parent node during distributed fuzzing.
+    ///
+    /// This method is expected to be called by child node modules during distributed fuzzing when they have connected
+    /// to their parent node and synchronized this fuzzer's state with that of the parent node. This method will then
+    /// determine the appropriate new state (typically .fuzzing) and dispatch the Synchronized event.
+    public func updateStateAfterSynchronizingWithParentNode() {
+        if state != .waiting {
+            // Nothing to do
+            return
+        }
+
+        if corpus.isEmpty && config.staticCorpus {
+            // This is a bit unfortunate: we are synchronized with our parent, which is presumably
+            // doing a corpus import, but haven't received any samples yet, so can't start fuzzing.
+            // Since we'll receive corpus samples as they are imported by our parent, we simply
+            // stay in the .waiting mode for some more time...
+            logger.info("Waiting some more time to receive corpus samples from parent instance...")
+            return timers.runAfter(15 * Seconds, updateStateAfterSynchronizingWithParentNode)
+        } else if corpus.isEmpty {
+            // Even after synchronizing with our parent node, we may still be left with an empty corpus.
+            // This can for example happen if the parent is configured to not share its corpus with its children,
+            // or because it itself still has an empty corpus. In that case, we simply do corpus generation.
+            changeState(to: .corpusGeneration)
+        } else {
+            changeState(to: .fuzzing)
+        }
+
+        // We only dispatch the Synchronized event once, when we do the .waiting -> someOtherState transition.
+        assert(state != .waiting)
+        dispatchEvent(events.Synchronized)
     }
 
     /// Starts the fuzzer and runs for the specified number of iterations.
     ///
     /// This must be called after initializing the fuzzer.
     /// Use -1 for maxIterations to run indefinitely.
-    public func start(runFor maxIterations: Int) {
+    public func start(runUntil exitCondition: ExitCondition = .none) {
         dispatchPrecondition(condition: .onQueue(queue))
         assert(isInitialized)
 
-        self.maxIterations = maxIterations
-
-        // There could currently be minimization tasks scheduled from a corpus import.
-        // Wait for these to complete before actually starting to fuzz.
-        fuzzGroup.notify(queue: queue) { self.startFuzzing() }
-    }
-
-    private func startFuzzing() {
-        dispatchPrecondition(condition: .onQueue(queue))
-
-        // When starting with an empty corpus, perform initial corpus generation using the GenerativeEngine.
-        if corpus.isEmpty {
-            logger.info("Empty corpus detected. Switching to the GenerativeEngine to perform initial corpus generation")
-            startInitialCorpusGeneration()
-        }
+        self.exitCondition = exitCondition
 
         logger.info("Let's go!")
 
-        if config.isFuzzing {
-            fuzzOne()
-        }
+        fuzzOne()
     }
 
     /// Shuts down this fuzzer.
@@ -265,16 +349,14 @@ public class Fuzzer {
         event.addListener(listener)
     }
 
-    /// Dispatches an event.
+    /// Dispatches an event, potentially with some data attached to the event.
     public func dispatchEvent<T>(_ event: Event<T>, data: T) {
         dispatchPrecondition(condition: .onQueue(queue))
         for listener in event.listeners {
             listener(data)
         }
     }
-
-    /// Dispatches an event.
-    public func dispatchEvent(_ event: Event<Void>) {
+    private func dispatchEvent(_ event: Event<Void>) {
         dispatchEvent(event, data: ())
     }
 
@@ -284,14 +366,16 @@ public class Fuzzer {
     /// be executed and evaluated to determine whether it results in previously unseen, interesting behaviour.
     /// When dropout is enabled, a configurable percentage of programs will be ignored during importing. This
     /// mechanism can help reduce the similarity of different fuzzer instances.
-    public func importProgram(_ program: Program, enableDropout: Bool = false, origin: ProgramOrigin) {
+    @discardableResult
+    public func importProgram(_ program: Program, enableDropout: Bool = false, origin: ProgramOrigin) -> ExecutionOutcome {
         dispatchPrecondition(condition: .onQueue(queue))
 
         if enableDropout && probability(config.dropoutRate) {
-            return
+            return .succeeded
         }
 
         let execution = execute(program)
+
         switch execution.outcome {
         case .crashed(let termsig):
             // Here we explicitly deal with the possibility that an interesting sample
@@ -299,13 +383,23 @@ public class Fuzzer {
             processCrash(program, withSignal: termsig, withStderr: execution.stderr, withStdout: execution.stdout, origin: origin, withExectime: execution.execTime)
 
         case .succeeded:
+            var imported = false
             if let aspects = evaluator.evaluate(execution) {
-                processMaybeInteresting(program, havingAspects: aspects, origin: origin)
+                imported = processMaybeInteresting(program, havingAspects: aspects, origin: origin)
+            }
+
+            if case .corpusImport(let mode) = origin, mode == .full, !imported {
+                // We're performing a full corpus import, so the sample still needs to be added to our corpus even though it doesn't trigger any new behaviour.
+                corpus.add(program, ProgramAspects(outcome: .succeeded))
+                // We also dispatch the InterestingProgramFound event here since we technically found an interesting program, but also so that the program is forwarded to child nodes.
+                dispatchEvent(events.InterestingProgramFound, data: (program, origin))
             }
 
         default:
             break
         }
+
+        return execution.outcome
     }
 
     /// Imports a crashing program into this fuzzer.
@@ -323,99 +417,35 @@ public class Fuzzer {
         }
     }
 
-    /// When importing a corpus, this determines how valid samples are added to the corpus
-    public enum CorpusImportMode {
-        /// All valid programs are added to the corpus. This is intended to aid in finding
-        /// variants of existing bugs. Programs are not minimized before inclusion.
-        case all
-
-        /// Only programs that increase coverage are included in the fuzzing corpus.
-        /// These samples are intended as a solid starting point for the fuzzer.
-        case interestingOnly(shouldMinimize: Bool)
-    }
-
-    /// Imports multiple programs into this fuzzer.
+    /// Schedules the given corpus of programs to be imported into this fuzzer.
     ///
-    /// This will import each program in the given array into this fuzzer while potentially discarding
-    /// some percentage of the programs if dropout is enabled.
-    public func importCorpus(_ corpus: [Program], importMode: CorpusImportMode, enableDropout: Bool = false) {
+    /// Corpus import happens asynchronously as it may take a considerable amount of time (each program
+    /// needs to be executed and possibly minimized). During corpus import, the current progress can be
+    /// obtained from corpusImportProgress().
+    public func scheduleCorpusImport(_ corpus: [Program], importMode: CorpusImportMode, enableDropout: Bool = false) {
         dispatchPrecondition(condition: .onQueue(queue))
-        for (count, program) in corpus.enumerated() {
-            if count % 500 == 0 {
-                logger.info("Imported \(count) of \(corpus.count)")
-            }
-            // Regardless of the import mode, we need to execute and evaluate the program first to update the evaluator state
-            let execution = execute(program)
-            guard execution.outcome == .succeeded else { continue }
-            let maybeAspects = evaluator.evaluate(execution)
+        // Currently we only allow corpus import when the fuzzer is still uninitialized.
+        // If necessary, this can be changed, but we'd need to be able to correctly handle the .waiting -> .corpusImport state transition.
+        assert(state == .uninitialized)
 
-            switch importMode {
-            case .all:
-                self.corpus.add(program, maybeAspects ?? ProgramAspects(outcome: .succeeded))
-            case .interestingOnly(let shouldMinimize):
-                if let aspects = maybeAspects {
-                    processMaybeInteresting(program, havingAspects: aspects, origin: .corpusImport(shouldMinimize: shouldMinimize))
-                }
-            }
+        guard state != .corpusImport && currentCorpusImportJob.isFinished else {
+            // TODO support this
+            return logger.error("Cannot currently schedule multiple corpus imports")
         }
 
-        if case .interestingOnly(let shouldMinimize) = importMode, shouldMinimize {
-            // The corpus is being minimized now. Schedule a task to signal when the corpus import has really finished
-            phase = .corpusImport
-            fuzzGroup.notify(queue: queue) {
-                self.logger.info("Corpus import and minimization completed. Corpus now contains \(self.corpus.size) programs")
-                self.phase = .fuzzing
-            }
+        guard !corpus.isEmpty else {
+            // Nothing to do.
+            return
         }
+
+        currentCorpusImportJob = CorpusImportJob(corpus: corpus, mode: importMode)
+        changeState(to: .corpusImport)
     }
 
-    /// All programs currently in the corpus.
-    public func exportCorpus() -> [Program] {
-        return corpus.allPrograms()
-    }
-
-    /// Exports the internal state of this fuzzer.
-    ///
-    /// The state returned by this function can be passed to the importState method to restore
-    /// the state. This can be used to synchronize different fuzzer instances and makes it
-    /// possible to resume a previous fuzzing run at a later time.
-    /// Note that for this to work, the instances need to be configured identically, i.e. use
-    /// the same components (in particular, corpus) and the same build of the target engine.
-    public func exportState() throws -> Data {
-        dispatchPrecondition(condition: .onQueue(queue))
-
-        if supportsFastStateSynchronization {
-            let state = try Fuzzilli_Protobuf_FuzzerState.with {
-                $0.corpus = try corpus.exportState()
-                $0.evaluatorState = evaluator.exportState()
-            }
-            return try state.serializedData()
-        } else {
-            // Just export all samples in the current corpus
-            return try encodeProtobufCorpus(exportCorpus())
-        }
-    }
-
-    /// Import a previously exported fuzzing state.
-    public func importState(from data: Data) throws {
-        dispatchPrecondition(condition: .onQueue(queue))
-
-        if supportsFastStateSynchronization {
-            let state = try Fuzzilli_Protobuf_FuzzerState(serializedData: data)
-            try corpus.importState(state.corpus)
-            try evaluator.importState(state.evaluatorState)
-        } else {
-            let corpus = try decodeProtobufCorpus(data)
-            importCorpus(corpus, importMode: .interestingOnly(shouldMinimize: false))
-        }
-    }
-
-    /// Whether the internal state of this fuzzer instance can be serialized and restored elsewhere, e.g. on a worker instance.
-    private var supportsFastStateSynchronization: Bool {
-        // We might eventually need to check that the other relevant components
-        // (in particular the evaluator) support this as well, but currenty all
-        // of them do.
-        return corpus.supportsFastStateSynchronization
+    /// Computes and returns the corpus import progress as percentage.
+    public func corpusImportProgress() -> Double {
+        assert(state == .corpusImport)
+        return currentCorpusImportJob.progress()
     }
 
     /// Executes a program.
@@ -485,9 +515,13 @@ public class Fuzzer {
                     program.comments.add("Imported program is interesting due to \(aspects)", at: .footer)
                 }
             }
-            assert(!program.code.contains(where: { $0.op is JSInternalOperation }))
+            assert(!program.code.contains(where: { $0.op is JsInternalOperation }))
             dispatchEvent(events.InterestingProgramFound, data: (program, origin))
-            corpus.add(program, aspects)
+
+            // If we're running in static corpus mode, we only add programs to our corpus during corpus import.
+            if !config.staticCorpus || origin.isFromCorpusImport() {
+                corpus.add(program, aspects)
+            }
         }
 
         if !origin.requiresMinimization() {
@@ -509,12 +543,18 @@ public class Fuzzer {
         func processCommon(_ program: Program) {
             let hasCrashInfo = program.comments.at(.footer)?.contains("CRASH INFO") ?? false
             if !hasCrashInfo {
-                program.comments.add("CRASH INFO\n==========\n", at: .footer)
-                program.comments.add("TERMSIG: \(termsig)\n", at: .footer)
-                program.comments.add("STDERR:\n" + stderr, at: .footer)
-                program.comments.add("STDOUT:\n" + stdout, at: .footer)
-                program.comments.add("ARGS: \(runner.processArguments.joined(separator: " "))\n", at: .footer)
-                program.comments.add("EXECUTION TIME: \(Int(exectime * 1000)) ms", at: .footer)
+                program.comments.add("CRASH INFO", at: .footer)
+                program.comments.add("==========", at: .footer)
+                if let tag = config.tag {
+                    program.comments.add("INSTANCE TAG: \(tag)", at: .footer)
+                }
+                program.comments.add("TERMSIG: \(termsig)", at: .footer)
+                program.comments.add("STDERR:", at: .footer)
+                program.comments.add(stderr.trimmingCharacters(in: .newlines), at: .footer)
+                program.comments.add("STDOUT:", at: .footer)
+                program.comments.add(stdout.trimmingCharacters(in: .newlines), at: .footer)
+                program.comments.add("ARGS: \(runner.processArguments.joined(separator: " "))", at: .footer)
+                program.comments.add("EXECUTION TIME: \(Int(exectime * 1000))ms", at: .footer)
             }
             assert(program.comments.at(.footer)?.contains("CRASH INFO") ?? false)
 
@@ -550,18 +590,64 @@ public class Fuzzer {
     /// Performs one round of fuzzing.
     private func fuzzOne() {
         dispatchPrecondition(condition: .onQueue(queue))
-        assert(config.isFuzzing)
+        assert(currentCorpusImportJob.isFinished || state == .corpusImport)
 
         guard !self.isStopped else { return }
 
-        guard maxIterations == -1 || iterations < maxIterations else {
-            return shutdown(reason: .finished)
+        // Check if we are done fuzzing.
+        switch exitCondition {
+        case .none:
+            break
+        case .iterationsPerformed(let maxIterations):
+            if iterations > maxIterations {
+                return shutdown(reason: .finished)
+            }
+        case .timeFuzzed(let maxRuntime):
+            if uptime() > maxRuntime {
+                return shutdown(reason: .finished)
+            }
         }
-        iterations += 1
 
-        engine.fuzzOne(fuzzGroup)
+        switch state {
+        case .uninitialized:
+            fatalError("This state should never be observed here")
 
-        if phase == .initialCorpusGeneration {
+        case .waiting:
+            // Nothing to do, we're waiting for our parent node to send us a corpus.
+            // To avoid idle spinning, just sleep for a short while
+            Thread.sleep(forTimeInterval: 5 * Seconds)
+
+            if uptime() > 15 * Minutes {
+                logger.fatal("Did not receive a corpus from our parent node within 15 minutes")
+            }
+
+        case .corpusImport:
+            assert(!currentCorpusImportJob.isFinished)
+            let program = currentCorpusImportJob.nextProgram()
+
+            if currentCorpusImportJob.numberOfProgramsImportedSoFar % 500 == 0 {
+                logger.info("Corpus import prograss: imported \(currentCorpusImportJob.numberOfProgramsImportedSoFar) of \(currentCorpusImportJob.totalNumberOfProgramsToImport) programs")
+            }
+
+            let outcome = importProgram(program, origin: .corpusImport(mode: currentCorpusImportJob.importMode))
+            currentCorpusImportJob.notifyImportOutcome(outcome)
+
+            if currentCorpusImportJob.isFinished {
+                logger.info("Corpus import finished:")
+                logger.info("\(currentCorpusImportJob.numberOfProgramsThatExecutedSuccessfullyDuringImport)/\(currentCorpusImportJob.totalNumberOfProgramsToImport) programs executed successfully during import")
+                logger.info("\(currentCorpusImportJob.numberOfProgramsThatTimedOutDuringImport)/\(currentCorpusImportJob.totalNumberOfProgramsToImport) programs timed out during import")
+                logger.info("\(currentCorpusImportJob.numberOfProgramsThatFailedDuringImport)/\(currentCorpusImportJob.totalNumberOfProgramsToImport) programs failed to execute during import")
+                logger.info("Corpus now contains \(corpus.size) programs")
+                changeState(to: .fuzzing)
+            }
+
+        case .corpusGeneration:
+            // We should never perform corpus generation if we're using a static corpus.
+            assert(!config.staticCorpus)
+
+            iterations += 1
+            corpusGenerationEngine.fuzzOne(fuzzGroup)
+
             // Perform initial corpus generation until we haven't found a new interesting sample in the last N
             // iterations. The rough order of magnitude of N has been determined experimentally: run two instances with
             // different values (e.g. 10 and 100) for roughly the same number of iterations (approximately until both
@@ -571,27 +657,18 @@ public class Fuzzer {
                     logger.fatal("Initial corpus generation failed, corpus is still empty. Is the evaluator working correctly?")
                 }
                 logger.info("Initial corpus generation finished. Corpus now contains \(corpus.size) elements")
-                finishInitialCorpusGeneration()
+                changeState(to: .fuzzing)
             }
+
+        case .fuzzing:
+            iterations += 1
+            engine.fuzzOne(fuzzGroup)
         }
 
-        // Do the next fuzzing iteration as soon as all tasks related to the current iteration are finished.
+        // Perform the next iteration as soon as all tasks related to the current iteration are finished.
         fuzzGroup.notify(queue: queue) {
             self.fuzzOne()
         }
-    }
-
-    private func startInitialCorpusGeneration() {
-        nextEngine = engine
-        engine = GenerativeEngine()
-        engine.initialize(with: self)
-        phase = .initialCorpusGeneration
-    }
-
-    private func finishInitialCorpusGeneration() {
-        engine = nextEngine!
-        nextEngine = nil
-        phase = .fuzzing
     }
 
     /// Constructs a non-trivial program. Useful to measure program execution speed.
@@ -599,8 +676,8 @@ public class Fuzzer {
         let b = makeBuilder()
 
         let f = b.buildPlainFunction(with: .parameters(n: 2)) { params in
-            let x = b.loadProperty("x", of: params[0])
-            let y = b.loadProperty("y", of: params[0])
+            let x = b.getProperty("x", of: params[0])
+            let y = b.getProperty("y", of: params[0])
             let s = b.binary(x, y, with: .Add)
             let p = b.binary(s, params[1], with: .Mul)
             b.doReturn(p)
@@ -638,16 +715,16 @@ public class Fuzzer {
         // Check if we can execute programs
         var execution = execute(Program())
         guard case .succeeded = execution.outcome else {
-            logger.fatal("Cannot execute programs (exit code must be zero when no exception was thrown). Are the command line flags valid?")
+            logger.fatal("Cannot execute programs (exit code must be zero when no exception was thrown, but execution outcome was \(execution.outcome)). Are the command line flags valid?")
         }
 
         // Check if we can detect failed executions (i.e. an exception was thrown)
-        var b = self.makeBuilder()
+        var b = makeBuilder()
         let exception = b.loadInt(42)
         b.throwException(exception)
         execution = execute(b.finalize())
         guard case .failed = execution.outcome else {
-            logger.fatal("Cannot detect failed executions (exit code must be nonzero when an uncaught exception was thrown)")
+            logger.fatal("Cannot detect failed executions (exit code must be nonzero when an uncaught exception was thrown, but execution outcome was \(execution.outcome))")
         }
 
         var maxExecutionTime: TimeInterval = 0
@@ -687,5 +764,54 @@ public class Fuzzer {
         }
 
         logger.info("Startup tests finished successfully")
+    }
+
+    /// A pending corpus import job together with some statistics.
+    private struct CorpusImportJob {
+        private var corpusToImport: [Program]
+
+        let importMode: CorpusImportMode
+        let totalNumberOfProgramsToImport: Int
+
+        private(set) var numberOfProgramsImportedSoFar = 0
+        private(set) var numberOfProgramsThatFailedDuringImport = 0
+        private(set) var numberOfProgramsThatTimedOutDuringImport = 0
+        private(set) var numberOfProgramsThatExecutedSuccessfullyDuringImport = 0
+
+        init(corpus: [Program], mode: CorpusImportMode) {
+            self.corpusToImport = corpus.reversed()         // Programs are taken from the end.
+            self.importMode = mode
+            self.totalNumberOfProgramsToImport = corpus.count
+        }
+
+        var isFinished: Bool {
+            return corpusToImport.isEmpty
+        }
+
+        mutating func nextProgram() -> Program {
+            assert(!isFinished)
+            numberOfProgramsImportedSoFar += 1
+            return corpusToImport.removeLast()
+        }
+
+        mutating func notifyImportOutcome(_ outcome: ExecutionOutcome) {
+            switch outcome {
+            case .crashed:
+                // This is unexpected so we don't track these
+                break
+            case .failed:
+                numberOfProgramsThatFailedDuringImport += 1
+            case .succeeded:
+                numberOfProgramsThatExecutedSuccessfullyDuringImport += 1
+            case .timedOut:
+                numberOfProgramsThatTimedOutDuringImport += 1
+            }
+        }
+
+        func progress() -> Double {
+            let numberOfProgramsToImport = Double(totalNumberOfProgramsToImport)
+            let numberOfProgramsAlreadyImported = Double(numberOfProgramsImportedSoFar)
+            return numberOfProgramsAlreadyImported / numberOfProgramsToImport
+        }
     }
 }

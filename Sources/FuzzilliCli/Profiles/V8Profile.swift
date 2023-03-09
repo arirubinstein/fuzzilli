@@ -14,25 +14,90 @@
 
 import Fuzzilli
 
-fileprivate let ForceV8TurbofanGenerator = CodeGenerator("ForceV8TurbofanGenerator", input: .function()) { b, f in
+fileprivate let ForceJITCompilationThroughLoopGenerator = CodeGenerator("ForceJITCompilationThroughLoopGenerator", input: .function()) { b, f in
     // The MutationEngine may use variables of unknown type as input as well, however, we only want to call functions that we generated ourselves. Further, attempting to call a non-function will result in a runtime exception.
     // For both these reasons, we abort here if we cannot prove that f is indeed a function.
     guard b.type(of: f).Is(.function()) else { return }
-    guard let arguments = b.randCallArguments(for: f) else { return }
+    guard let arguments = b.randomCallArguments(for: f) else { return }
 
     b.buildRepeat(n: 100) { _ in
         b.callFunction(f, withArgs: arguments)
     }
 }
 
+fileprivate let ForceTurboFanCompilationGenerator = CodeGenerator("ForceTurboFanCompilationGenerator", input: .function()) { b, f in
+    // See comment in ForceJITCompilationThroughLoopGenerator.
+    guard b.type(of: f).Is(.function()) else { return }
+    guard let arguments = b.randomCallArguments(for: f) else { return }
+
+    b.callFunction(f, withArgs: arguments)
+
+    b.eval("%PrepareFunctionForOptimization(%@)", with: [f]);
+
+    b.callFunction(f, withArgs: arguments)
+    b.callFunction(f, withArgs: arguments)
+
+    b.eval("%OptimizeFunctionOnNextCall(%@)", with: [f]);
+
+    b.callFunction(f, withArgs: arguments)
+}
+
+fileprivate let ForceMaglevCompilationGenerator = CodeGenerator("ForceMaglevCompilationGenerator", input: .function()) { b, f in
+    // See comment in ForceJITCompilationThroughLoopGenerator.
+    guard b.type(of: f).Is(.function()) else { return }
+    guard let arguments = b.randomCallArguments(for: f) else { return }
+
+    b.callFunction(f, withArgs: arguments)
+
+    b.eval("%PrepareFunctionForOptimization(%@)", with: [f]);
+
+    b.callFunction(f, withArgs: arguments)
+    b.callFunction(f, withArgs: arguments)
+
+    b.eval("%OptimizeMaglevOnNextCall(%@)", with: [f]);
+
+    b.callFunction(f, withArgs: arguments)
+}
+
 fileprivate let TurbofanVerifyTypeGenerator = CodeGenerator("TurbofanVerifyTypeGenerator", input: .anything) { b, v in
     b.eval("%VerifyType(%@)", with: [v])
+}
+
+fileprivate let WorkerGenerator = RecursiveCodeGenerator("WorkerGenerator") { b in
+    let workerSignature = Signature(withParameterCount: Int.random(in: 0...3))
+
+    // TODO(cffsmith): currently Fuzzilli does not know that this code is sent
+    // to another worker as a string. This has the consequence that we might
+    // use variables inside the worker that are defined in a different scope
+    // and as such they are not accessible / undefined. To fix this we should
+    // define an Operation attribute that tells Fuzzilli to ignore variables
+    // defined in outer scopes.
+    let workerFunction = b.buildPlainFunction(with: .signature(workerSignature)) { args in
+        let this = b.loadThis()
+
+        // Generate a random onmessage handler for incoming messages.
+        let onmessageFunction = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+            b.buildRecursive(block: 1, of: 2)
+        }
+        b.setProperty("onmessage", of: this, to: onmessageFunction)
+
+        b.buildRecursive(block: 2, of: 2)
+    }
+    let workerConstructor = b.loadBuiltin("Worker")
+
+    let functionString = b.loadString("function")
+    let argumentsArray = b.createArray(with: b.generateCallArguments(for: workerSignature))
+
+    let configObject = b.createObject(with: ["type": functionString, "arguments": argumentsArray])
+
+    let worker = b.construct(workerConstructor, withArgs: [workerFunction, configObject])
+    // Fuzzilli can now use the worker.
 }
 
 fileprivate let SerializeDeserializeGenerator = CodeGenerator("SerializeDeserializeGenerator", input: .object()) { b, o in
     // Load necessary builtins
     let d8 = b.reuseOrLoadBuiltin("d8")
-    let serializer = b.loadProperty("serializer", of: d8)
+    let serializer = b.getProperty("serializer", of: d8)
     let Uint8Array = b.reuseOrLoadBuiltin("Uint8Array")
 
     // Serialize a random object
@@ -46,12 +111,12 @@ fileprivate let SerializeDeserializeGenerator = CodeGenerator("SerializeDeserial
     let newByte: Variable
     if probability(0.5) {
         let bit = b.loadInt(1 << Int.random(in: 0..<8))
-        let oldByte = b.loadElement(index, of: u8)
+        let oldByte = b.getElement(index, of: u8)
         newByte = b.binary(oldByte, bit, with: .Xor)
     } else {
         newByte = b.loadInt(Int64.random(in: 0..<256))
     }
-    b.storeElement(newByte, at: index, of: u8)
+    b.setElement(index, of: u8, to: newByte)
 
     // Deserialize the resulting buffer
     let _ = b.callMethod("deserialize", on: serializer, withArgs: [content])
@@ -61,11 +126,11 @@ fileprivate let SerializeDeserializeGenerator = CodeGenerator("SerializeDeserial
 
 fileprivate let MapTransitionsTemplate = ProgramTemplate("MapTransitionsTemplate") { b in
     // This template is meant to stress the v8 Map transition mechanisms.
-    // Basically, it generates a bunch of CreateObject, LoadProperty, StoreProperty, FunctionDefinition,
+    // Basically, it generates a bunch of CreateObject, GetProperty, SetProperty, FunctionDefinition,
     // and CallFunction operations operating on a small set of objects and property names.
 
     let propertyNames = ["a", "b", "c", "d", "e", "f", "g"]
-    assert(Set(propertyNames).isDisjoint(with: b.fuzzer.environment.customMethodNames))
+    assert(Set(propertyNames).isDisjoint(with: b.fuzzer.environment.customMethods))
 
     // Use this as base object type. For one, this ensures that the initial map is stable.
     // Moreover, this guarantees that when querying for this type, we will receive one of
@@ -101,13 +166,13 @@ fileprivate let MapTransitionsTemplate = ProgramTemplate("MapTransitionsTemplate
     }
     let propertyLoadGenerator = CodeGenerator("PropertyLoad", input: objType) { b, obj in
         assert(objects.contains(obj))
-        b.loadProperty(chooseUniform(from: propertyNames), of: obj)
+        b.getProperty(chooseUniform(from: propertyNames), of: obj)
     }
     let propertyStoreGenerator = CodeGenerator("PropertyStore", input: objType) { b, obj in
         assert(objects.contains(obj))
         let numProperties = Int.random(in: 1...4)
         for _ in 0..<numProperties {
-            b.storeProperty(chooseUniform(from: propertyValues), as: chooseUniform(from: propertyNames), on: obj)
+            b.setProperty(chooseUniform(from: propertyNames), of: obj, to: chooseUniform(from: propertyValues))
         }
     }
     let functionDefinitionGenerator = RecursiveCodeGenerator("FunctionDefinition") { b in
@@ -115,19 +180,19 @@ fileprivate let MapTransitionsTemplate = ProgramTemplate("MapTransitionsTemplate
         b.buildPlainFunction(with: .signature(sig)) { params in
             objects += params
             b.buildRecursive()
-            b.doReturn(b.randVar(ofType: objType)!)
+            b.doReturn(b.randomVariable(ofType: objType)!)
         }
         objects.removeLast(objects.count - prevSize)
     }
     let functionCallGenerator = CodeGenerator("FunctionCall", input: .function()) { b, f in
-        let args = b.randCallArguments(for: sig)!
+        let args = b.randomCallArguments(for: sig)!
         assert(objects.contains(args[0]) && objects.contains(args[1]))
         let rval = b.callFunction(f, withArgs: args)
         assert(b.type(of: rval).Is(objType))
         objects.append(rval)
     }
     let functionJitCallGenerator = CodeGenerator("FunctionJitCall", input: .function()) { b, f in
-        let args = b.randCallArguments(for: sig)!
+        let args = b.randomCallArguments(for: sig)!
         assert(objects.contains(args[0]) && objects.contains(args[1]))
         b.buildForLoop(b.loadInt(0), .lessThan, b.loadInt(100), .Add, b.loadInt(1)) { _ in
             b.callFunction(f, withArgs: args)       // Rval goes out-of-scope immediately, so no need to track it
@@ -145,7 +210,7 @@ fileprivate let MapTransitionsTemplate = ProgramTemplate("MapTransitionsTemplate
     ])
 
     // ... and generate a bunch of code.
-    b.build(n: 100, by: .runningGenerators)
+    b.build(n: 100, by: .generating)
 
     // Now, restore the previous code generators, re-enable splicing, and generate some more code
     b.fuzzer.codeGenerators = prevCodeGenerators
@@ -187,7 +252,7 @@ fileprivate let VerifyTypeTemplate = ProgramTemplate("VerifyTypeTemplate") { b i
         // Generate function body and sprinkle calls to %VerifyType
         for _ in 0..<10 {
             b.build(n: 3)
-            b.eval("%VerifyType(%@)", with: [b.randVar()])
+            b.eval("%VerifyType(%@)", with: [b.randomVariable()])
         }
     }
 
@@ -215,43 +280,84 @@ fileprivate let VerifyTypeTemplate = ProgramTemplate("VerifyTypeTemplate") { b i
 }
 
 let v8Profile = Profile(
-    getProcessArguments: { (randomizingArguments: Bool) -> [String] in
+    processArgs: { randomize in
         var args = [
             "--expose-gc",
+            "--omit-quit",
+            "--allow-natives-syntax",
+            "--interrupt-budget=1024",
+            "--interrupt-budget-for-maglev=128",
             "--future",
             "--harmony",
-            "--assert-types",
-            "--harmony-rab-gsab",
-            "--harmony-struct",
-            "--allow-natives-syntax",
-            "--interrupt-budget=1000",
             "--fuzzing"]
 
-        guard randomizingArguments else { return args }
+        guard randomize else { return args }
 
-        args.append(probability(0.9) ? "--sparkplug" : "--no-sparkplug")
-        args.append(probability(0.9) ? "--opt" : "--no-opt")
-        args.append(probability(0.9) ? "--lazy" : "--no-lazy")
-        args.append(probability(0.1) ? "--always-opt" : "--no-always-opt")
-        args.append(probability(0.1) ? "--always-osr" : "--no-always-osr")
-        args.append(probability(0.1) ? "--force-slow-path" : "--no-force-slow-path")
-        args.append(probability(0.9) ? "--turbo-move-optimization" : "--no-turbo-move-optimization")
-        args.append(probability(0.9) ? "--turbo-jt" : "--no-turbo-jt")
-        args.append(probability(0.9) ? "--turbo-loop-peeling" : "--no-turbo-loop-peeling")
-        args.append(probability(0.9) ? "--turbo-loop-variable" : "--no-turbo-loop-variable")
-        args.append(probability(0.9) ? "--turbo-loop-rotation" : "--no-turbo-loop-rotation")
-        args.append(probability(0.9) ? "--turbo-cf-optimization" : "--no-turbo-cf-optimization")
-        args.append(probability(0.9) ? "--turbo-escape" : "--no-turbo-escape")
-        args.append(probability(0.9) ? "--turbo-allocation-folding" : "--no-turbo-allocation-folding")
-        args.append(probability(0.9) ? "--turbo-instruction-scheduling" : "--no-turbo-instruction-scheduling")
-        args.append(probability(0.9) ? "--turbo-stress-instruction-scheduling" : "--no-turbo-stress-instruction-scheduling")
-        args.append(probability(0.9) ? "--turbo-store-elimination" : "--no-turbo-store-elimination")
-        args.append(probability(0.9) ? "--turbo-rewrite-far-jumps" : "--no-turbo-rewrite-far-jumps")
-        args.append(probability(0.9) ? "--turbo-optimize-apply" : "--no-turbo-optimize-apply")
-        args.append(chooseUniform(from: ["--no-enable-sse3", "--no-enable-ssse3", "--no-enable-sse4-1", "--no-enable-sse4-2", "--no-enable-avx", "--no-enable-avx2",]))
-        args.append(probability(0.9) ? "--turbo-load-elimination" : "--no-turbo-load-elimination")
-        args.append(probability(0.9) ? "--turbo-inlining" : "--no-turbo-inlining")
-        args.append(probability(0.9) ? "--turbo-splitting" : "--no-turbo-splitting")
+        //
+        // Future features that should sometimes be enabled.
+        //
+        if probability(0.5) {
+            args.append("--harmony-struct")
+        }
+
+        if probability(0.1) {
+            args.append("--turboshaft")
+
+            if probability(0.25) {
+                args.append("--turboshaft-assert-types")
+            }
+        }
+
+        //
+        // Sometimes enable additional verification logic (which may be fairly expensive).
+        //
+        if probability(0.1) {
+            args.append("--verify-heap")
+        }
+        if probability(0.1) {
+            args.append("--turbo-verify")
+        }
+        if probability(0.1) {
+            args.append("--turbo-verify-allocation")
+        }
+
+        //
+        // Existing features that should sometimes be disabled or made more aggressive.
+        //
+        if probability(0.1) {
+            args.append("--no-maglev")
+        }
+
+        if probability(0.1) {
+            args.append(probability(0.5) ? "--always-sparkplug" : "--no-sparkplug")
+        }
+
+        //
+        // More exotic configuration changes.
+        //
+        if probability(0.1) {
+            args.append(probability(0.5) ? "--lazy" : "--no-lazy")
+            args.append(probability(0.5) ? "--always-turbofan" : "--no-always-turbofan")
+            args.append(probability(0.5) ? "--always-osr" : "--no-always-osr")
+            args.append(probability(0.5) ? "--force-slow-path" : "--no-force-slow-path")
+            args.append(probability(0.5) ? "--turbo-move-optimization" : "--no-turbo-move-optimization")
+            args.append(probability(0.5) ? "--turbo-jt" : "--no-turbo-jt")
+            args.append(probability(0.5) ? "--turbo-loop-peeling" : "--no-turbo-loop-peeling")
+            args.append(probability(0.5) ? "--turbo-loop-variable" : "--no-turbo-loop-variable")
+            args.append(probability(0.5) ? "--turbo-loop-rotation" : "--no-turbo-loop-rotation")
+            args.append(probability(0.5) ? "--turbo-cf-optimization" : "--no-turbo-cf-optimization")
+            args.append(probability(0.5) ? "--turbo-escape" : "--no-turbo-escape")
+            args.append(probability(0.5) ? "--turbo-allocation-folding" : "--no-turbo-allocation-folding")
+            args.append(probability(0.5) ? "--turbo-instruction-scheduling" : "--no-turbo-instruction-scheduling")
+            args.append(probability(0.5) ? "--turbo-stress-instruction-scheduling" : "--no-turbo-stress-instruction-scheduling")
+            args.append(probability(0.5) ? "--turbo-store-elimination" : "--no-turbo-store-elimination")
+            args.append(probability(0.5) ? "--turbo-rewrite-far-jumps" : "--no-turbo-rewrite-far-jumps")
+            args.append(probability(0.5) ? "--turbo-optimize-apply" : "--no-turbo-optimize-apply")
+            args.append(chooseUniform(from: ["--no-enable-sse3", "--no-enable-ssse3", "--no-enable-sse4-1", "--no-enable-sse4-2", "--no-enable-avx", "--no-enable-avx2"]))
+            args.append(probability(0.5) ? "--turbo-load-elimination" : "--no-turbo-load-elimination")
+            args.append(probability(0.5) ? "--turbo-inlining" : "--no-turbo-inlining")
+            args.append(probability(0.5) ? "--turbo-splitting" : "--no-turbo-splitting")
+        }
 
         return args
     },
@@ -263,14 +369,9 @@ let v8Profile = Profile(
     timeout: 250,
 
     codePrefix: """
-                function main() {
                 """,
 
     codeSuffix: """
-                gc();
-                }
-                %NeverOptimizeFunction(main);
-                main();
                 """,
 
     ecmaVersion: ECMAScriptVersion.es6,
@@ -278,9 +379,12 @@ let v8Profile = Profile(
     crashTests: ["fuzzilli('FUZZILLI_CRASH', 0)", "fuzzilli('FUZZILLI_CRASH', 1)", "fuzzilli('FUZZILLI_CRASH', 2)"],
 
     additionalCodeGenerators: [
-        (ForceV8TurbofanGenerator,      10),
-        (TurbofanVerifyTypeGenerator,   10),
-        (SerializeDeserializeGenerator, 10),
+        (ForceJITCompilationThroughLoopGenerator,  5),
+        (ForceTurboFanCompilationGenerator,        5),
+        (ForceMaglevCompilationGenerator,          5),
+        (TurbofanVerifyTypeGenerator,             10),
+        (SerializeDeserializeGenerator,           10),
+        (WorkerGenerator,                         10),
     ],
 
     additionalProgramTemplates: WeightedList<ProgramTemplate>([
@@ -293,5 +397,6 @@ let v8Profile = Profile(
     additionalBuiltins: [
         "gc"                                            : .function([] => .undefined),
         "d8"                                            : .object(),
+        "Worker"                                        : .constructor([.anything, .object()] => .object(withMethods: ["postMessage","getMessage"])),
     ]
 )

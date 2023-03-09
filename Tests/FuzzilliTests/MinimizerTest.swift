@@ -35,9 +35,9 @@ class MinimizerTests: XCTestCase {
 
         var o1 = b.createObject(with: [:])
         evaluator.nextInstructionIsImportant(in: b)
-        b.storeComputedProperty(n3, as: bar, on: o1)
+        b.setComputedProperty(bar, of: o1, to: n3)
         let o2 = b.createObject(with: [:])
-        b.storeComputedProperty(n4, as: baz, on: o2)
+        b.setComputedProperty(baz, of: o2, to: n4)
 
         let originalProgram = b.finalize()
 
@@ -47,7 +47,7 @@ class MinimizerTests: XCTestCase {
         b.loadString("foo")
         bar = b.loadString("bar")
         o1 = b.createObject(with: [:])
-        b.storeComputedProperty(n3, as: bar, on: o1)
+        b.setComputedProperty(bar, of: o1, to: n3)
 
         let expectedProgram = b.finalize()
 
@@ -56,7 +56,175 @@ class MinimizerTests: XCTestCase {
         XCTAssertEqual(expectedProgram, actualProgram)
     }
 
-    func testSwitchCaseMinimizationA() {
+    func testObjectLiteralMinimization() {
+        let evaluator = EvaluatorForMinimizationTests()
+        let fuzzer = makeMockFuzzer(evaluator: evaluator)
+        let b = fuzzer.makeBuilder()
+
+        // Build input program to be minimized.
+        let v = b.loadInt(42)
+        var n = b.loadString("MyObject")
+        // This object literal is important, but not all of its fields.
+        var o = b.buildObjectLiteral { obj in
+            evaluator.nextInstructionIsImportant(in: b)
+            obj.addProperty("name", as: n)
+            obj.addProperty("foo", as: v)
+            evaluator.nextInstructionIsImportant(in: b)
+            obj.addMethod("m", with: .parameters(n: 1)) { args in
+                let this = args[0]
+                let prefix = b.loadString("Hello World from ")
+                let name = b.getProperty("name", of: this)
+                let msg = b.binary(prefix, name, with: .Add)
+                evaluator.nextInstructionIsImportant(in: b)
+                b.doReturn(msg)
+            }
+            obj.addGetter(for: "bar") { this in
+                b.doReturn(b.loadString("baz"))
+            }
+        }
+
+        evaluator.nextInstructionIsImportant(in: b)
+        b.callMethod("m", on: o, withArgs: [])
+
+        // This object literal can be removed entirely.
+        b.buildObjectLiteral { obj in
+            obj.addGetter(for: "x") { this in
+                b.doReturn(b.loadInt(1337))
+            }
+            obj.addProperty("y", as: v)
+            obj.addMethod("m", with: .parameters(n: 0)) { args in
+                let this = args[0]
+                let x = b.getProperty("x", of: this)
+                let y = b.getProperty("y", of: this)
+                let r = b.binary(x, y, with: .Add)
+                b.doReturn(r)
+            }
+        }
+
+        let originalProgram = b.finalize()
+
+        // Build expected output program.
+        n = b.loadString("MyObject")
+        o = b.buildObjectLiteral { obj in
+            obj.addProperty("name", as: n)
+            obj.addMethod("m", with: .parameters(n: 1)) { args in
+                let this = args[0]
+                let prefix = b.loadString("Hello World from ")
+                let name = b.getProperty("name", of: this)
+                let msg = b.binary(prefix, name, with: .Add)
+                b.doReturn(msg)
+            }
+        }
+
+        b.callMethod("m", on: o, withArgs: [])
+
+        let expectedProgram = b.finalize()
+
+        // Perform minimization and check that the two programs are equal.
+        let actualProgram = minimize(originalProgram, with: fuzzer)
+        XCTAssertEqual(expectedProgram, actualProgram)
+    }
+
+    func testClassDefinitionMinimization() {
+        let evaluator = EvaluatorForMinimizationTests()
+        let fuzzer = makeMockFuzzer(evaluator: evaluator)
+        let b = fuzzer.makeBuilder()
+
+        // Build input program to be minimized.
+        var s = b.loadString("foobar")
+        // This class is important, but not all of its fields
+        var class1 = b.buildClassDefinition { cls in
+            evaluator.nextInstructionIsImportant(in: b)
+            cls.addPrivateInstanceProperty("name", value: s)
+            cls.addInstanceProperty("foo")
+            cls.addInstanceElement(0)
+            cls.addInstanceElement(1)
+            evaluator.nextInstructionIsImportant(in: b)
+            cls.addInstanceMethod("m", with: .parameters(n: 0)) { args in
+                let this = args[0]
+                let v = b.getPrivateProperty("name", of: this)
+                evaluator.nextInstructionIsImportant(in: b)
+                b.doReturn(v)
+            }
+            cls.addInstanceGetter(for: "bar") { this in
+                b.doReturn(b.loadInt(42))
+            }
+        }
+
+        evaluator.nextInstructionIsImportant(in: b)
+        b.construct(class1, withArgs: [])
+
+        // Only the body of a method of this class is important, the class itself should be removed
+        let class2 = b.buildClassDefinition(withSuperclass: class1) { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { args in
+                let this = args[0]
+                b.setProperty("bar", of: this, to: args[1])
+            }
+            cls.addInstanceMethod("foo", with: .parameters(n: 0)) { args in
+                let importantFunction = b.loadBuiltin("ImportantFunction")
+                evaluator.nextInstructionIsImportant(in: b)
+                b.callFunction(importantFunction, withArgs: [])
+            }
+            cls.addStaticMethod("bar", with: .parameters(n: 1)) { args in
+                let this = args[0]
+                b.setProperty("baz", of: this, to: args[1])
+            }
+            cls.addStaticProperty("baz")
+        }
+        let unusedInstance = b.construct(class2, withArgs: [])
+        b.callMethod("foo", on: unusedInstance, withArgs: [])
+
+        // This class can be removed entirely
+        let supercls = b.loadBuiltin("SuperClass")
+        let class3 = b.buildClassDefinition(withSuperclass: supercls) { cls in
+            cls.addInstanceProperty("x", value: s)
+            cls.addInstanceProperty("y")
+            cls.addInstanceComputedProperty(s)
+            cls.addInstanceMethod("m", with: .parameters(n: 0)) { args in
+                let this = args[0]
+                let x = b.getProperty("x", of: this)
+                let y = b.getProperty("y", of: this)
+                let r = b.binary(x, y, with: .Add)
+                b.doReturn(r)
+            }
+            cls.addStaticMethod("n", with: .parameters(n: 1)) { args in
+                let n = b.loadInt(1337)
+                b.doReturn(n)
+            }
+            cls.addStaticSetter(for: "bar") { this, v in
+            }
+            cls.addPrivateStaticProperty("bla")
+            cls.addPrivateStaticMethod("m", with: .parameters(n: 1)) { args in
+                let this = args[0]
+                b.setPrivateProperty("bla", of: this, to: args[1])
+            }
+        }
+        b.construct(class3, withArgs: [])
+
+        let originalProgram = b.finalize()
+
+        // Build expected output program.
+        s = b.loadString("foobar")
+        class1 = b.buildClassDefinition { cls in
+            cls.addPrivateInstanceProperty("name", value: s)
+            cls.addInstanceMethod("m", with: .parameters(n: 0)) { args in
+                let this = args[0]
+                let v = b.getPrivateProperty("name", of: this)
+                b.doReturn(v)
+            }
+        }
+        b.construct(class1, withArgs: [])
+        let importantFunction = b.loadBuiltin("ImportantFunction")
+        b.callFunction(importantFunction, withArgs: [])
+
+        let expectedProgram = b.finalize()
+
+        // Perform minimization and check that the two programs are equal.
+        let actualProgram = minimize(originalProgram, with: fuzzer)
+        XCTAssertEqual(expectedProgram, actualProgram)
+    }
+
+    func testSwitchCaseMinimization1() {
         let evaluator = EvaluatorForMinimizationTests()
         let fuzzer = makeMockFuzzer(evaluator: evaluator)
         let b = fuzzer.makeBuilder()
@@ -110,7 +278,7 @@ class MinimizerTests: XCTestCase {
         XCTAssertEqual(expectedProgram, actualProgram)
     }
 
-    func testSwitchCaseMinimizationB() {
+    func testSwitchCaseMinimization2() {
         let evaluator = EvaluatorForMinimizationTests()
         let fuzzer = makeMockFuzzer(evaluator: evaluator)
         let b = fuzzer.makeBuilder()
@@ -314,10 +482,10 @@ class MinimizerTests: XCTestCase {
         var o = b.createObject(with: [:])
         let c = b.buildCodeString {
             evaluator.nextInstructionIsImportant(in: b)
-            b.storeProperty(v, as: "foo", on: o)
+            b.setProperty("foo", of: o, to: v)
         }
         let k = b.loadString("code")
-        b.storeComputedProperty(c, as: k, on: o)
+        b.setComputedProperty(k, of: o, to: c)
         let eval = b.loadBuiltin("eval")
         b.callFunction(eval, withArgs: [c])
         b.deleteProperty("foo", of: o)
@@ -327,7 +495,7 @@ class MinimizerTests: XCTestCase {
         // Build expected output program.
         v = b.loadInt(42)
         o = b.createObject(with: [:])
-        b.storeProperty(v, as: "foo", on: o)
+        b.setProperty("foo", of: o, to: v)
 
         let expectedProgram = b.finalize()
 
@@ -353,7 +521,7 @@ class MinimizerTests: XCTestCase {
         var y = b.loadInt(1338)
         var r = b.callFunction(f, withArgs: [x, y])
         evaluator.nextInstructionIsImportant(in: b)
-        b.storeProperty(r, as: "result", on: o)
+        b.setProperty("result", of: o, to: r)
 
         // As we are not emulating the dataflow through the function call in our evaluator, the minimizer will try to remove the binary ops and integer loads
         // as they do not directly flow into the property store. To avoid this, we simply mark all binary ops and integer loads as important in this program.
@@ -371,7 +539,7 @@ class MinimizerTests: XCTestCase {
         y = b.loadInt(1338)
         let t = b.binary(m, x, with: .Mul)
         r = b.binary(t, y, with: .Add)
-        b.storeProperty(r, as: "result", on: o)
+        b.setProperty("result", of: o, to: r)
 
         let expectedProgram = b.finalize()
 
@@ -399,7 +567,7 @@ class MinimizerTests: XCTestCase {
         var r = b.callFunction(f, withArgs: [a1, a2])
         var o = b.createObject(with: [:])
         evaluator.nextInstructionIsImportant(in: b)
-        b.storeProperty(r, as: "result", on: o)
+        b.setProperty("result", of: o, to: r)
 
         let originalProgram = b.finalize()
 
@@ -421,7 +589,7 @@ class MinimizerTests: XCTestCase {
             b.reassign(r, to: u)
         })
         o = b.createObject(with: [:])
-        b.storeProperty(r, as: "result", on: o)
+        b.setProperty("result", of: o, to: r)
 
         let expectedProgram = b.finalize()
 
@@ -459,7 +627,7 @@ class MinimizerTests: XCTestCase {
         var y = b.loadInt(1338)
         var r = b.callFunction(f2, withArgs: [x, y])
         evaluator.nextInstructionIsImportant(in: b)
-        b.storeProperty(r, as: "result", on: o)
+        b.setProperty("result", of: o, to: r)
 
         let originalProgram = b.finalize()
 
@@ -474,7 +642,7 @@ class MinimizerTests: XCTestCase {
         let t1 = b.unary(.PostInc, x)
         let t2 = b.unary(.PostDec, y)
         r = b.binary(t1, t2, with: .Add)
-        b.storeProperty(r, as: "result", on: o)
+        b.setProperty("result", of: o, to: r)
 
         let expectedProgram = b.finalize()
 
@@ -496,30 +664,30 @@ class MinimizerTests: XCTestCase {
         b.reassign(n3, to: n1)
         var n4 = b.loadInt(45)
         b.reassign(n4, to: n3)
-        b.storeProperty(n4, as: "n4", on: o)        // This will store n1, i.e. 42
+        b.setProperty("n4", of: o, to: n4)        // This will store n1, i.e. 42
         var c = b.loadBool(true)
         b.buildIfElse(c, ifBody: {
             let n5 = b.loadInt(46)
             b.reassign(n1, to: n5)
-            b.storeProperty(n1, as: "n1", on: o)        // This will store n5, i.e. 46
-            b.storeProperty(n1, as: "n1", on: o)        // This will (again) store n5, i.e. 46
+            b.setProperty("n1", of: o, to: n1)        // This will store n5, i.e. 46
+            b.setProperty("n1", of: o, to: n1)        // This will (again) store n5, i.e. 46
             b.reassign(n1, to: n2)
-            b.storeProperty(n1, as: "n1", on: o)        // This will store n2, i.e. 43
+            b.setProperty("n1", of: o, to: n1)        // This will store n2, i.e. 43
         }, elseBody: {
             let n6 = b.loadInt(47)
             b.reassign(n1, to: n6)
-            b.storeProperty(n3, as: "n3", on: o)        // This will still store n3, i.e. 42
+            b.setProperty( "n3", of: o, to: n3)        // This will still store n3, i.e. 42
         })
-        b.storeProperty(n1, as: "n1", on: o)        // This will store n1, i.e. 42
+        b.setProperty("n1", of: o, to: n1)        // This will store n1, i.e. 42
         b.reassign(n1, to: n2)
-        b.storeProperty(n3, as: "n3", on: o)        // This will store n3, i.e. 42
+        b.setProperty("n3", of: o, to: n3)        // This will store n3, i.e. 42
 
         evaluator.operationIsImportant(Reassign.self)
 
         let originalProgram = b.finalize()
 
         // Keep all property stores and the if-else
-        evaluator.operationIsImportant(StoreProperty.self)
+        evaluator.operationIsImportant(SetProperty.self)
         evaluator.operationIsImportant(BeginIf.self)
 
         // Build expected output program.
@@ -530,25 +698,25 @@ class MinimizerTests: XCTestCase {
         b.reassign(n3, to: n1)
         n4 = b.loadInt(45)
         b.reassign(n4, to: n3)
-        b.storeProperty(n1, as: "n4", on: o)
+        b.setProperty("n4", of: o, to: n1)
         c = b.loadBool(true)
         b.buildIfElse(c, ifBody: {
             let n5 = b.loadInt(46)
             b.reassign(n1, to: n5)
-            b.storeProperty(n5, as: "n1", on: o)
-            b.storeProperty(n5, as: "n1", on: o) 
+            b.setProperty("n1", of: o, to: n5)
+            b.setProperty("n1", of: o, to: n5)
             b.reassign(n1, to: n2)
-            b.storeProperty(n2, as: "n1", on: o)
+            b.setProperty("n1", of: o, to: n2)
         }, elseBody: {
             let n6 = b.loadInt(47)
             b.reassign(n1, to: n6)
-            b.storeProperty(n3, as: "n3", on: o)
+            b.setProperty("n3", of: o, to: n3)
         })
         evaluator.nextInstructionIsImportant(in: b)
-        b.storeProperty(n1, as: "n1", on: o)
+        b.setProperty("n1", of: o, to: n1)
         b.reassign(n1, to: n2)
         evaluator.nextInstructionIsImportant(in: b)
-        b.storeProperty(n3, as: "n3", on: o)
+        b.setProperty("n3", of: o, to: n3)
 
         let expectedProgram = b.finalize()
 
@@ -603,7 +771,7 @@ class MinimizerTests: XCTestCase {
 
         // Build expected output program.
         o = b.loadBuiltin("TheObject")
-        let bar = b.loadProperty("bar", of: o)
+        let bar = b.getProperty("bar", of: o)
         print = b.loadBuiltin("print")
         b.callFunction(print, withArgs: [bar])
 
@@ -630,7 +798,7 @@ class MinimizerTests: XCTestCase {
 
         // Build expected output program.
         o = b.loadBuiltin("TheArray")
-        let bar = b.loadElement(4, of: o)
+        let bar = b.getElement(4, of: o)
         print = b.loadBuiltin("print")
         b.callFunction(print, withArgs: [bar])
 
@@ -801,26 +969,5 @@ class MinimizerTests: XCTestCase {
         evaluator.setOriginalProgram(program)
         let dummyAspects = ProgramAspects(outcome: .succeeded)
         return fuzzer.minimizer.minimize(program, withAspects: dummyAspects)
-    }
-}
-
-extension MinimizerTests {
-    static var allTests : [(String, (MinimizerTests) -> () throws -> Void)] {
-        return [
-            ("testGenericInstructionMinimization", testGenericInstructionMinimization),
-            ("testSwitchCaseMinimizationA", testSwitchCaseMinimizationA),
-            ("testSwitchCaseMinimizationB", testSwitchCaseMinimizationB),
-            ("testSwitchRemovalKeepContent", testSwitchRemovalKeepContent),
-            ("testSwitchRemoval", testSwitchRemoval),
-            ("testSwitchKeepDefaultCase", testSwitchKeepDefaultCase),
-            ("testCodeStringMinimization", testCodeStringMinimization),
-            ("testBasicInlining", testBasicInlining),
-            ("testInliningWithConditionalReturn", testInliningWithConditionalReturn),
-            ("testMultiInlining", testMultiInlining),
-            ("testReassignmentReduction", testReassignmentReduction),
-            ("testTryCatchRemoval", testTryCatchRemoval),
-            ("testDestructuringSimplification1", testDestructuringSimplification1),
-            ("testDestructuringSimplification2", testDestructuringSimplification2),
-        ]
     }
 }

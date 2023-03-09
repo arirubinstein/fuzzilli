@@ -52,11 +52,10 @@ class MockEnvironment: ComponentBase, Environment {
     var interestingRegExpQuantifiers: [String] = ["foo", "bar"]
 
     var builtins: Set<String>
-    var methodNames = Set(["m1", "m2"])
-    var readPropertyNames = Set(["foo", "bar"])
-    var writePropertyNames = Set(["foo", "bar"])
-    var customPropertyNames = Set(["foo", "bar"])
-    var customMethodNames = Set(["m1", "m2"])
+    var builtinProperties = Set(["foo", "bar"])
+    var builtinMethods = Set(["baz", "bla"])
+    var customProperties = Set(["a", "b"])
+    var customMethods = Set(["m", "n"])
 
     var intType = JSType.integer
     var bigIntType = JSType.bigint
@@ -64,7 +63,7 @@ class MockEnvironment: ComponentBase, Environment {
     var floatType = JSType.float
     var booleanType = JSType.boolean
     var stringType = JSType.string
-    var objectType = JSType.object()
+    var emptyObjectType = JSType.object()
     var arrayType = JSType.object()
 
     func functionType(forSignature signature: Signature) -> JSType {
@@ -180,7 +179,7 @@ public func makeMockFuzzer(engine maybeEngine: FuzzEngine? = nil, runner maybeRu
     let environment = maybeEnvironment ?? MockEnvironment(builtins: ["Foo": .integer, "Bar": .object(), "Baz": .function()])
 
     // A lifter to translate FuzzIL programs to JavaScript.
-    let lifter = JavaScriptLifter(prefix: "", suffix: "", inliningPolicy: InlineOnlyLiterals(), ecmaVersion: .es6)
+    let lifter = JavaScriptLifter(prefix: "", suffix: "", ecmaVersion: .es6)
 
     // Corpus managing interesting programs that have been found during fuzzing.
     let corpus = maybeCorpus ?? BasicCorpus(minSize: 1000, maxSize: 2000, minMutationsPerSample: 5)

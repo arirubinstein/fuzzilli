@@ -126,7 +126,7 @@ public struct JSType: Hashable {
     public static let regexp    = JSType(definiteType: .regexp)
 
     /// Type one can iterate over
-    public static let iterable   = JSType(definiteType: .iterable)        // TODO rename to .array?
+    public static let iterable  = JSType(definiteType: .iterable)        // TODO rename to .array?
 
     /// A value for which the type is not known.
     public static let unknown   = JSType(definiteType: .unknown)
@@ -148,6 +148,9 @@ public struct JSType: Hashable {
         let ext = TypeExtension(group: group, properties: Set(properties), methods: Set(methods), signature: nil)
         return JSType(definiteType: .object, ext: ext)
     }
+
+    /// An object for which it is not known what properties or methods it has, if any.
+    public static let unknownObject: JSType = .object()
 
     /// A function.
     public static func function(_ signature: Signature? = nil) -> JSType {
@@ -535,7 +538,7 @@ public struct JSType: Hashable {
     // TODO cache these in some kind of type transition table data structure?
     //
 
-    /// Returns a new ObjectType that represents this type with the added property.
+    /// Returns a new type that represents this type with the added property.
     public func adding(property: String) -> JSType {
         guard Is(.object()) else {
             return self
@@ -544,6 +547,11 @@ public struct JSType: Hashable {
         newProperties.insert(property)
         let newExt = TypeExtension(group: group, properties: newProperties, methods: methods, signature: signature)
         return JSType(definiteType: definiteType, possibleType: possibleType, ext: newExt)
+    }
+
+    /// Adds a property to this type.
+    public mutating func add(property: String) {
+        self = self.adding(property: property)
     }
 
     /// Returns a new ObjectType that represents this type without the removed property.
@@ -566,6 +574,11 @@ public struct JSType: Hashable {
         newMethods.insert(method)
         let newExt = TypeExtension(group: group, properties: properties, methods: newMethods, signature: signature)
         return JSType(definiteType: definiteType, possibleType: possibleType, ext: newExt)
+    }
+
+    /// Adds a method to this type.
+    public mutating func add(method: String) {
+        self = self.adding(method: method)
     }
 
     /// Returns a new ObjectType that represents this type without the removed property.
@@ -851,7 +864,7 @@ public struct Signature: Hashable, CustomStringConvertible {
     public var numParameters: Int {
         return parameters.count
     }
-    
+
     public var hasRestParameter: Bool {
         return parameters.last?.isRestParameter ?? false
     }

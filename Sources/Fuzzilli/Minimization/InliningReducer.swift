@@ -43,30 +43,55 @@ struct InliningReducer: Reducer {
         var activeSubroutineDefinitions = [Variable?]()
 
         for instr in code {
-            switch instr.op {
+            switch instr.op.opcode {
                 // Currently we only inline plain functions as that guarantees that the resulting code is always valid.
                 // Otherwise, we might for example attempt to inline an async function containing an 'await', which would not be valid.
                 // This works fine because the ReplaceReducer will attempt to turn "special" functions into plain functions.
-            case is BeginPlainFunction:
+            case .beginPlainFunction:
                 candidates[instr.output] = (callCount: 0, index: instr.index)
                 fallthrough
-            case is BeginAnySubroutine:
-                activeSubroutineDefinitions.append(instr.output)
-            case is EndAnySubroutine:
+            case .beginArrowFunction,
+                 .beginGeneratorFunction,
+                 .beginAsyncFunction,
+                 .beginAsyncArrowFunction,
+                 .beginAsyncGeneratorFunction,
+                 .beginConstructor,
+                 .beginObjectLiteralMethod,
+                 .beginObjectLiteralGetter,
+                 .beginObjectLiteralSetter,
+                 .beginClassConstructor,
+                 .beginClassInstanceMethod,
+                 .beginClassInstanceGetter,
+                 .beginClassInstanceSetter,
+                 .beginClassStaticInitializer,
+                 .beginClassStaticMethod,
+                 .beginClassStaticGetter,
+                 .beginClassStaticSetter,
+                 .beginClassPrivateInstanceMethod,
+                 .beginClassPrivateStaticMethod:
+                activeSubroutineDefinitions.append(instr.hasOneOutput ? instr.output : nil)
+            case .endPlainFunction,
+                 .endArrowFunction,
+                 .endGeneratorFunction,
+                 .endAsyncFunction,
+                 .endAsyncArrowFunction,
+                 .endAsyncGeneratorFunction,
+                 .endConstructor,
+                 .endObjectLiteralMethod,
+                 .endObjectLiteralGetter,
+                 .endObjectLiteralSetter,
+                 .endClassConstructor,
+                 .endClassInstanceMethod,
+                 .endClassInstanceGetter,
+                 .endClassInstanceSetter,
+                 .endClassStaticInitializer,
+                 .endClassStaticMethod,
+                 .endClassStaticGetter,
+                 .endClassStaticSetter,
+                 .endClassPrivateInstanceMethod,
+                 .endClassPrivateStaticMethod:
                 activeSubroutineDefinitions.removeLast()
-            case is BeginClass:
-                // TODO remove this special handling (and the asserts) once class constructors and methods are also subroutines
-                assert(!(instr.op is BeginAnySubroutine))
-                activeSubroutineDefinitions.append(nil)
-                // Currently needed as BeginClass can have inputs. Refactor this when refactoring classes.
-                deleteCandidates(instr.inputs)
-            case is BeginMethod:
-                assert(!(instr.op is BeginAnySubroutine))
-                // This closes a subroutine and starts a new one, so is effectively a nop.
-                break
-            case is EndClass:
-                activeSubroutineDefinitions.removeLast()
-            case is CallFunction:
+            case .callFunction:
                 let f = instr.input(0)
 
                 if let candidate = candidates[f] {
@@ -80,7 +105,7 @@ struct InliningReducer: Reducer {
 
                 // Can't inline functions that are passed as arguments to other functions.
                 deleteCandidates(instr.inputs.dropFirst())
-            case is LoadArguments:
+            case .loadArguments:
                 // Can't inline functions if they access their arguments.
                 if let function = activeSubroutineDefinitions.last! {
                     candidates.removeValue(forKey: function)
@@ -186,7 +211,9 @@ struct InliningReducer: Reducer {
 
             // Returns (from the function being inlined) are converted to assignments to the return value.
             if instr.op is Return && functionDefinitionDepth == 0 {
-                c.append(Instruction(Reassign(), inputs: [rval, newInstr.input(0)]))
+                // Returns may not have a return value, in which case we'll use undefined.
+                let value = newInstr.hasInputs ? newInstr.input(0) : undefined
+                c.append(Instruction(Reassign(), inputs: [rval, value]))
             } else {
                 c.append(newInstr)
 

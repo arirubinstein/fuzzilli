@@ -57,8 +57,10 @@ public class BasicCorpus: ComponentBase, Collection, Corpus {
     }
 
     override func initialize() {
-        // Schedule a timer to perform cleanup regularly
-        fuzzer.timers.scheduleTask(every: 30 * Minutes, cleanup)
+        // Schedule a timer to perform cleanup regularly, but only if we're not running as static corpus.
+        if !fuzzer.config.staticCorpus {
+            fuzzer.timers.scheduleTask(every: 30 * Minutes, cleanup)
+        }
     }
 
     public var size: Int {
@@ -77,7 +79,7 @@ public class BasicCorpus: ComponentBase, Collection, Corpus {
         addInternal(program)
     }
 
-    private func addInternal(_ program: Program) {
+    public func addInternal(_ program: Program) {
         if program.size > 0 {
             prepareProgramForInclusion(program, index: totalEntryCounter)
             programs.append(program)
@@ -122,6 +124,7 @@ public class BasicCorpus: ComponentBase, Collection, Corpus {
     }
 
     private func cleanup() {
+        assert(!fuzzer.config.staticCorpus)
         var newPrograms = RingBuffer<Program>(maxSize: programs.maxSize)
         var newAges = RingBuffer<Int>(maxSize: ages.maxSize)
 

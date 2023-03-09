@@ -18,7 +18,7 @@ fileprivate let ForceSpidermonkeyIonGenerator = CodeGenerator("ForceSpidermonkey
     // The MutationEngine may use variables of unknown type as input as well, however, we only want to call functions that we generated ourselves. Further, attempting to call a non-function will result in a runtime exception.
     // For both these reasons, we abort here if we cannot prove that f is indeed a function.
     guard b.type(of: f).Is(.function()) else { return }
-    guard let arguments = b.randCallArguments(for: f) else { return }
+    guard let arguments = b.randomCallArguments(for: f) else { return }
 
     b.buildRepeat(n: 100) { _ in
         b.callFunction(f, withArgs: arguments)
@@ -26,7 +26,7 @@ fileprivate let ForceSpidermonkeyIonGenerator = CodeGenerator("ForceSpidermonkey
 }
 
 let spidermonkeyProfile = Profile(
-    getProcessArguments: { (randomizingArguments: Bool) -> [String] in
+    processArgs: { randomize in
         var args = [
             "--baseline-warmup-threshold=10",
             "--ion-warmup-threshold=100",
@@ -36,7 +36,7 @@ let spidermonkeyProfile = Profile(
             "--disable-oom-functions",
             "--reprl"]
 
-        guard randomizingArguments else { return args }
+        guard randomize else { return args }
 
         args.append("--small-function-length=\(1<<Int.random(in: 7...12))")
         args.append("--inlining-entry-threshold=\(1<<Int.random(in: 2...10))")
@@ -75,13 +75,10 @@ let spidermonkeyProfile = Profile(
     timeout: 250,
 
     codePrefix: """
-                function main() {
                 """,
 
     codeSuffix: """
                 gc();
-                }
-                main();
                 """,
 
     ecmaVersion: ECMAScriptVersion.es6,

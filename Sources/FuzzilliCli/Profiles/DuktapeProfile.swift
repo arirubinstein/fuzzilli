@@ -15,8 +15,8 @@
 import Fuzzilli
 
 let duktapeProfile = Profile(
-    getProcessArguments: { (randomizingArguments: Bool) -> [String] in
-        return ["--reprl"]
+    processArgs: { randomize in
+        ["--reprl"]
     },
 
     processEnv: ["UBSAN_OPTIONS": "handle_segv=0"],
@@ -26,13 +26,9 @@ let duktapeProfile = Profile(
     timeout: 250,
 
     codePrefix: """
-                function placeholder(){}
-                function main() {
                 """,
 
     codeSuffix: """
-                }
-                main();
                 """,
 
     ecmaVersion: ECMAScriptVersion.es5,

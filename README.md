@@ -103,8 +103,8 @@ A fuzzer instance (implemented in [Fuzzer.swift](Sources/Fuzzilli/Fuzzer.swift))
 Furthermore, a number of modules are optionally available:
 
 * [Statistics](Sources/Fuzzilli/Modules/Statistics.swift): gathers various pieces of statistical information.
-* [NetworkWorker/NetworkMaster](Sources/Fuzzilli/Modules/NetworkSync.swift): synchronize multiple instances over the network.
-* [ThreadWorker/ThreadMaster](Sources/Fuzzilli/Modules/ThreadSync.swift): synchronize multiple instances within the same process.
+* [NetworkSync](Sources/Fuzzilli/Modules/NetworkSync.swift): synchronize multiple instances over the network.
+* [ThreadSync](Sources/Fuzzilli/Modules/ThreadSync.swift): synchronize multiple instances within the same process.
 * [Storage](Sources/Fuzzilli/Modules/Storage.swift): stores crashing programs to disk.
 
 The fuzzer is event-driven, with most of the interactions between different classes happening through events. Events are dispatched e.g. as a result of a crash or an interesting program being found, a new program being executed, a log message being generated and so on. See [Events.swift](Sources/Fuzzilli/Core/Events.swift) for the full list of events. The event mechanism effectively decouples the various components of the fuzzer and makes it easy to implement additional modules.
@@ -119,13 +119,12 @@ Fuzzilli uses a custom execution mode called [REPRL (read-eval-print-reset-loop)
 
 There is one [Fuzzer](Sources/Fuzzilli/Fuzzer.swift) instance per target process. This enables synchronous execution of programs and thereby simplifies the implementation of various algorithms such as consecutive mutations and minimization. Moreover, it avoids the need to implement thread-safe access to internal state, e.g. the corpus. Each fuzzer instance has its own [DispatchQueue](https://developer.apple.com/documentation/dispatch/dispatchqueue), conceptually corresponding to a single thread. As a rule of thumb, every interaction with a Fuzzer instance must happen on that instance’s dispatch queue. This guarantees thread-safety as the queue is serial. For more details see [the docs](Docs/ProcessingModel.md).
 
-To scale, fuzzer instances can become workers, in which case they report newly found interesting samples and crashes to a master instance. In turn, the master instances also synchronize their corpus with the workers. Communication between masters and workers can happen in different ways, each implemented as a module:
+To scale, fuzzer instances can form a tree hierarchy, in which case they report newly found interesting samples and crashes to their parent node. In turn, a parent node synchronizes its corpus with its child nodes. Communication between nodes in the tree can happen in different ways, each implemented as a module:
 
 * [Inter-thread communication](Sources/Fuzzilli/Modules/ThreadSync.swift): synchronize instances in the same process by enqueuing tasks to the other fuzzer’s DispatchQueue.
-* Inter-process communication (TODO): synchronize instances over an IPC channel.
 * [Inter-machine communication](Sources/Fuzzilli/Modules/NetworkSync.swift): synchronize instances over a simple TCP-based protocol.
 
-This design allows the fuzzer to scale to many cores on a single machine as well as to many different machines. As one master instance can quickly become overloaded if too many workers send programs to it, it is also possible to configure multiple tiers of master instances, e.g. one master instance, 16 intermediate masters connected to the master, and 256 workers connected to the intermediate masters.
+This design allows the fuzzer to scale to many cores on a single machine as well as to many different machines. As one parent node can quickly become overloaded if too many instances send programs to it, it is possible to configure multiple levels of instances, e.g. one root instance, 16 intermediate nodes connected to the root, and 256 "leaves" connected to the intermediate nodes. See the [Cloud/](Cloud/) directory for more information about distributed fuzzing.
 
 ## Resources
 
@@ -133,12 +132,15 @@ Further resources about this fuzzer:
 
 * A [presentation](https://saelo.github.io/presentations/offensivecon_19_fuzzilli.pdf) about Fuzzilli given at Offensive Con 2019.
 * The [master's thesis](https://saelo.github.io/papers/thesis.pdf) for which the initial implementation was done.
-* A [blogpost](https://sensepost.com/blog/2020/the-hunt-for-chromium-issue-1072171/) by Sensepost about using Fuzzilli to find a bug in v8
-* A [blogpost](https://blog.doyensec.com/2020/09/09/fuzzilli-jerryscript.html) by Doyensec about fuzzing the JerryScript engine with Fuzzilli
+* A [blogpost](https://sensepost.com/blog/2020/the-hunt-for-chromium-issue-1072171/) by Sensepost about using Fuzzilli to find a bug in v8.
+* A [blogpost](https://blog.doyensec.com/2020/09/09/fuzzilli-jerryscript.html) by Doyensec about fuzzing the JerryScript engine with Fuzzilli.
+* A [paper](https://www.ndss-symposium.org/ndss-paper/fuzzilli-fuzzing-for-javascript-jit-compiler-vulnerabilities/) from the NDSS Symposium 2023 about Fuzzilli and how it compares to other fuzzers.
 
 ## Bug Showcase
 
-The following is a list of some of the bugs found with the help of Fuzzilli. Only bugs with security impact are included in the list. Special thanks to all users of Fuzzilli who have reported bugs found by it!
+The following is a list of some of the bugs found with the help of Fuzzilli. Only bugs with security impact that were present in at least a Beta release of the affected software should be included in this list. Since Fuzzilli is often used for continuous fuzz testing during development, many issues found by it are not included in this list as they are typically found prior to the vulnerable code reaching a Beta release. A list of all issues recently found by Fuzzilli in V8 can, however, be found [here](https://bugs.chromium.org/p/chromium/issues/list?q=label%3Afuzzilli&can=1).
+
+Special thanks to all users of Fuzzilli who have reported bugs found by it!
 
 #### WebKit/JavaScriptCore
 
@@ -160,6 +162,9 @@ The following is a list of some of the bugs found with the help of Fuzzilli. Onl
 * [CVE-2020-3901](https://bugs.webkit.org/show_bug.cgi?id=206805): GetterSetter type confusion in FTL JIT code (due to not always safe LICM)
 * [CVE-2021-30851](https://bugs.webkit.org/show_bug.cgi?id=227988): Missing lock during concurrent HashTable lookup
 * [CVE-2021-30818](https://bugs.webkit.org/show_bug.cgi?id=223278): Type confusion when reconstructing arguments on DFG OSR Exit
+* [CVE-2022-46696](https://bugs.webkit.org/show_bug.cgi?id=246942): Assertion failure due to missing exception check in JIT-compiled code
+* [CVE-2022-46699](https://bugs.webkit.org/show_bug.cgi?id=247420): Assertion failure due to incorrect caching of special properties in ICs
+* [CVE-2022-46700](https://bugs.webkit.org/show_bug.cgi?id=247562): Intl.Locale.prototype.hourCycles leaks empty JSValue to script
 
 #### Gecko/Spidermonkey
 
@@ -172,6 +177,7 @@ The following is a list of some of the bugs found with the help of Fuzzilli. Onl
 * [CVE-2020-15656](https://bugzilla.mozilla.org/show_bug.cgi?id=1647293): Type confusion for special arguments in IonMonkey
 * [CVE-2022-42928](https://bugzilla.mozilla.org/show_bug.cgi?id=1791520): Missing KeepAlive annotations for some BigInt operations may lead to memory corruption
 * [CVE-2022-45406](https://bugzilla.mozilla.org/show_bug.cgi?id=1791975): Use-after-free of a JavaScript Realm
+* [CVE-2023-25735](https://bugzilla.mozilla.org/show_bug.cgi?id=1810711): Potential use-after-free from compartment mismatch
 
 #### Chromium/v8
 
@@ -186,6 +192,8 @@ The following is a list of some of the bugs found with the help of Fuzzilli. Onl
 * [CVE-2020-6512](https://bugs.chromium.org/p/chromium/issues/detail?id=1084820): Type Confusion in V8
 * [CVE-2020-16006](https://bugs.chromium.org/p/chromium/issues/detail?id=1133527): Memory corruption due to improperly handled hash collision in DescriptorArray
 * [CVE-2021-37991](https://bugs.chromium.org/p/chromium/issues/detail?id=1250660): Race condition during concurrent JIT compilation
+* [Issue 1359937](https://bugs.chromium.org/p/chromium/issues/detail?id=1359937): Deserialization of BigInts could result in invalid -0n value
+* [Issue 1377775](https://bugs.chromium.org/p/chromium/issues/detail?id=1377775): Incorrect type check when inlining Array.prototype.at in Turbofan
 
 #### [Duktape](https://github.com/svaarala/duktape)
 

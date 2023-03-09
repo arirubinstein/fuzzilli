@@ -19,475 +19,652 @@ public class FuzzILLifter: Lifter {
 
     public init() {}
 
+    private func lift(_ v: Variable) -> String {
+        return "v\(v.number)"
+    }
+
     private func lift(_ instr : Instruction, with w: inout ScriptWriter) {
-        func input(_ n: Int) -> Variable {
-            return instr.input(n)
+        func input(_ n: Int) -> String {
+            return lift(instr.input(n))
         }
 
-        // Helper function to lift call arguments
-        func liftCallArguments(_ args: ArraySlice<Variable>, spreading spreads: [Bool] = []) -> String {
-            var arguments = [String]()
-            for (i, v) in args.enumerated() {
-                if spreads.count > i && spreads[i] {
-                    arguments.append("...\(v.identifier)")
-                } else {
-                    arguments.append(v.identifier)
-                }
-            }
-            return arguments.joined(separator: ", ")
+        func output() -> String {
+            return lift(instr.output)
         }
 
-        // Helper function to lift destruct array operations
-        func liftArrayPattern(indices: [Int64], outputs: [String], hasRestElement: Bool) -> String {
-            assert(indices.count == outputs.count)
-
-            var arrayPattern = ""
-            var lastIndex = 0
-            for (index64, output) in zip(indices, outputs) {
-                let index = Int(index64)
-                let skipped = index - lastIndex
-                lastIndex = index
-                let dots = index == indices.last! && hasRestElement ? "..." : ""
-                arrayPattern += String(repeating: ",", count: skipped) + dots + output
-            }
-
-            return arrayPattern
+        func innerOutput() -> String {
+            return lift(instr.innerOutput)
         }
 
-        func liftObjectDestructPattern(properties: [String], outputs: [String], hasRestElement: Bool) -> String {
-            assert(outputs.count == properties.count + (hasRestElement ? 1 : 0))
+        switch instr.op.opcode {
+        case .loadInteger(let op):
+            w.emit("\(output()) <- LoadInteger '\(op.value)'")
 
-            var objectPattern = ""
-            for (property, output) in zip(properties, outputs) {
-                objectPattern += "\(property):\(output),"
+        case .loadBigInt(let op):
+            w.emit("\(output()) <- LoadBigInt '\(op.value)'")
+
+        case .loadFloat(let op):
+            w.emit("\(output()) <- LoadFloat '\(op.value)'")
+
+        case .loadString(let op):
+            w.emit("\(output()) <- LoadString '\(op.value)'")
+
+        case .loadRegExp(let op):
+            w.emit("\(output()) <- LoadRegExp '\(op.pattern)' '\(op.flags.asString())'")
+
+        case .loadBoolean(let op):
+            w.emit("\(output()) <- LoadBoolean '\(op.value)'")
+
+        case .loadUndefined:
+            w.emit("\(output()) <- LoadUndefined")
+
+        case .loadNull:
+            w.emit("\(output()) <- LoadNull")
+
+        case .loadThis:
+            w.emit("\(output()) <- LoadThis")
+
+        case .loadArguments:
+            w.emit("\(output()) <- LoadArguments")
+
+        case .beginObjectLiteral:
+            w.emit("BeginObjectLiteral")
+            w.increaseIndentionLevel()
+
+        case .objectLiteralAddProperty(let op):
+            w.emit("ObjectLiteralAddProperty `\(op.propertyName)`, \(input(0))")
+
+        case .objectLiteralAddElement(let op):
+            w.emit("ObjectLiteralAddElement `\(op.index)`, \(input(0))")
+
+        case .objectLiteralAddComputedProperty:
+            w.emit("ObjectLiteralAddComputedProperty \(input(0)), \(input(1))")
+
+        case .objectLiteralSetPrototype:
+            w.emit("ObjectLiteralSetPrototype \(input(0))")
+
+        case .beginObjectLiteralMethod(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginObjectLiteralMethod `\(op.methodName)` -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endObjectLiteralMethod:
+            w.decreaseIndentionLevel()
+            w.emit("EndObjectLiteralMethod")
+
+        case .beginObjectLiteralGetter(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginObjectLiteralGetter `\(op.propertyName)` -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endObjectLiteralGetter:
+            w.decreaseIndentionLevel()
+            w.emit("EndObjectLiteralGetter")
+
+        case .beginObjectLiteralSetter(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginObjectLiteralSetter `\(op.propertyName)` -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endObjectLiteralSetter:
+            w.decreaseIndentionLevel()
+            w.emit("EndObjectLiteralSetter")
+
+        case .objectLiteralCopyProperties:
+            w.emit("ObjectLiteralCopyProperties \(input(0))")
+
+        case .endObjectLiteral:
+            w.decreaseIndentionLevel()
+            w.emit("\(output()) <- EndObjectLiteral")
+
+        case .beginClassDefinition(let op):
+            var line = "\(output()) <- BeginClassDefinition"
+            if op.hasSuperclass {
+               line += " \(input(0))"
             }
-            if hasRestElement {
-                objectPattern += "...\(outputs.last!)"
+            w.emit(line)
+            w.increaseIndentionLevel()
+
+        case .beginClassConstructor:
+           let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+           w.emit("BeginClassConstructor -> \(params)")
+           w.increaseIndentionLevel()
+
+        case .endClassConstructor:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassConstructor")
+
+        case .classAddInstanceProperty(let op):
+            if op.hasValue {
+                w.emit("ClassAddInstanceProperty '\(op.propertyName)' \(input(0))")
+            } else {
+                w.emit("ClassAddInstanceProperty '\(op.propertyName)'")
             }
 
-            return objectPattern
-        }
-
-        switch instr.op {
-        case let op as LoadInteger:
-            w.emit("\(instr.output) <- LoadInteger '\(op.value)'")
-
-        case let op as LoadBigInt:
-            w.emit("\(instr.output) <- LoadBigInt '\(op.value)'")
-
-        case let op as LoadFloat:
-            w.emit("\(instr.output) <- LoadFloat '\(op.value)'")
-
-        case let op as LoadString:
-            w.emit("\(instr.output) <- LoadString '\(op.value)'")
-
-        case let op as LoadRegExp:
-            w.emit("\(instr.output) <- LoadRegExp '\(op.value)' '\(op.flags.asString())'")
-
-        case let op as LoadBoolean:
-            w.emit("\(instr.output) <- LoadBoolean '\(op.value)'")
-
-        case is LoadUndefined:
-            w.emit("\(instr.output) <- LoadUndefined")
-
-        case is LoadNull:
-            w.emit("\(instr.output) <- LoadNull")
-
-        case is LoadThis:
-            w.emit("\(instr.output) <- LoadThis")
-
-        case is LoadArguments:
-            w.emit("\(instr.output) <- LoadArguments")
-
-        case let op as CreateObject:
-            var properties = [String]()
-            for (index, propertyName) in op.propertyNames.enumerated() {
-                properties.append("'\(propertyName)':\(input(index))")
+        case .classAddInstanceElement(let op):
+            if op.hasValue {
+                w.emit("ClassAddInstanceElement '\(op.index)' \(input(0))")
+            } else {
+                w.emit("ClassAddInstanceElement '\(op.index)'")
             }
-            w.emit("\(instr.output) <- CreateObject [\(properties.joined(separator: ", "))]")
 
-        case is CreateArray:
-            let elems = instr.inputs.map({ $0.identifier }).joined(separator: ", ")
-            w.emit("\(instr.output) <- CreateArray [\(elems)]")
-
-        case let op as CreateObjectWithSpread:
-            var properties = [String]()
-            for (index, propertyName) in op.propertyNames.enumerated() {
-                properties.append("'\(propertyName)':\(input(index))")
+        case .classAddInstanceComputedProperty(let op):
+            if op.hasValue {
+                w.emit("ClassAddInstanceComputedProperty \(input(0)) \(input(1))")
+            } else {
+                w.emit("ClassAddInstanceComputedProperty \(input(0))")
             }
-            // Remaining ones are spread.
-            for v in instr.inputs.dropFirst(properties.count) {
-                properties.append("...\(v)")
-            }
-            w.emit("\(instr.output) <- CreateObjectWithSpread [\(properties.joined(separator: ", "))]")
 
-        case let op as CreateArrayWithSpread:
+        case .beginClassInstanceMethod(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginClassInstanceMethod '\(op.methodName)' -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endClassInstanceMethod:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassInstanceMethod")
+
+        case .beginClassInstanceGetter(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginClassInstanceGetter `\(op.propertyName)` -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endClassInstanceGetter:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassInstanceGetter")
+
+        case .beginClassInstanceSetter(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginClassInstanceSetter `\(op.propertyName)` -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endClassInstanceSetter:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassInstanceSetter")
+
+        case .classAddStaticProperty(let op):
+            if op.hasValue {
+                w.emit("ClassAddStaticProperty '\(op.propertyName)' \(input(0))")
+            } else {
+                w.emit("ClassAddStaticProperty '\(op.propertyName)'")
+            }
+
+        case .classAddStaticElement(let op):
+            if op.hasValue {
+                w.emit("ClassAddStaticElement '\(op.index)' \(input(0))")
+            } else {
+                w.emit("ClassAddStaticElement '\(op.index)'")
+            }
+
+        case .classAddStaticComputedProperty(let op):
+            if op.hasValue {
+                w.emit("ClassAddStaticComputedProperty \(input(0)) \(input(1))")
+            } else {
+                w.emit("ClassAddStaticComputedProperty \(input(0))")
+            }
+
+        case .beginClassStaticInitializer:
+            w.emit("BeginClassStaticInitializer -> \(lift(instr.innerOutput))")
+            w.increaseIndentionLevel()
+
+        case .endClassStaticInitializer:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassStaticInitializer")
+
+        case .beginClassStaticMethod(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginClassStaticMethod '\(op.methodName)' -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endClassStaticMethod:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassStaticMethod")
+
+        case .beginClassStaticGetter(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginClassStaticGetter `\(op.propertyName)` -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endClassStaticGetter:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassStaticGetter")
+
+        case .beginClassStaticSetter(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginClassStaticSetter `\(op.propertyName)` -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endClassStaticSetter:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassStaticSetter")
+
+        case .classAddPrivateInstanceProperty(let op):
+            if op.hasValue {
+                w.emit("ClassAddPrivateInstanceProperty '\(op.propertyName)' \(input(0))")
+            } else {
+                w.emit("ClassAddPrivateInstanceProperty '\(op.propertyName)'")
+            }
+
+        case .beginClassPrivateInstanceMethod(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginClassPrivateInstanceMethod '\(op.methodName)' -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endClassPrivateInstanceMethod:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassPrivateInstanceMethod")
+
+        case .classAddPrivateStaticProperty(let op):
+            if op.hasValue {
+                w.emit("ClassAddPrivateStaticProperty '\(op.propertyName)' \(input(0))")
+            } else {
+                w.emit("ClassAddPrivateStaticProperty '\(op.propertyName)'")
+            }
+
+        case .beginClassPrivateStaticMethod(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("BeginClassPrivateStaticMethod '\(op.methodName)' -> \(params)")
+            w.increaseIndentionLevel()
+
+        case .endClassPrivateStaticMethod:
+            w.decreaseIndentionLevel()
+            w.emit("EndClassPrivateStaticMethod")
+
+        case .endClassDefinition:
+           w.decreaseIndentionLevel()
+           w.emit("EndClassDefinition")
+
+        case .createArray:
+            let elems = instr.inputs.map(lift).joined(separator: ", ")
+            w.emit("\(output()) <- CreateArray [\(elems)]")
+
+        case .createIntArray(let op):
+            w.emit("\(instr.output) <- CreateIntArray \(op.values)")
+
+        case .createFloatArray(let op):
+            w.emit("\(instr.output) <- CreateFloatArray \(op.values)")
+
+        case .createArrayWithSpread(let op):
             var elems = [String]()
             for (i, v) in instr.inputs.enumerated() {
                 if op.spreads[i] {
-                    elems.append("...\(v)")
+                    elems.append("...\(lift(v))")
                 } else {
-                    elems.append(v.identifier)
+                    elems.append(lift(v))
                 }
             }
-            w.emit("\(instr.output) <- CreateArrayWithSpread [\(elems.joined(separator: ", "))]")
+            w.emit("\(output()) <- CreateArrayWithSpread [\(elems.joined(separator: ", "))]")
 
-        case let op as CreateTemplateString:
+        case .createTemplateString(let op):
             let parts = op.parts.map({ "'\($0)'" }).joined(separator: ", ")
-            let values = instr.inputs.map({ $0.identifier }).joined(separator: ", ")
-            w.emit("\(instr.output) <- CreateTemplateString [\(parts)], [\(values)]")
+            let values = instr.inputs.map(lift).joined(separator: ", ")
+            w.emit("\(output()) <- CreateTemplateString [\(parts)], [\(values)]")
 
-        case let op as LoadBuiltin:
-            w.emit("\(instr.output) <- LoadBuiltin '\(op.builtinName)'")
+        case .loadBuiltin(let op):
+            w.emit("\(output()) <- LoadBuiltin '\(op.builtinName)'")
 
-        case let op as LoadProperty:
-            w.emit("\(instr.output) <- LoadProperty \(input(0)), '\(op.propertyName)'")
+        case .getProperty(let op):
+            w.emit("\(output()) <- GetProperty \(input(0)), '\(op.propertyName)'")
 
-        case let op as StoreProperty:
-            w.emit("StoreProperty \(input(0)), '\(op.propertyName)', \(input(1))")
+        case .setProperty(let op):
+            w.emit("SetProperty \(input(0)), '\(op.propertyName)', \(input(1))")
 
-        case let op as StorePropertyWithBinop:
-            w.emit("\(instr.input(0)) <- StorePropertyWithBinop '\(op.op.token)', \(input(1))")
+        case .updateProperty(let op):
+            w.emit("\(input(0)) <- UpdateProperty '\(op.op.token)', \(input(1))")
 
-        case let op as DeleteProperty:
-            w.emit("\(instr.output) <- DeleteProperty \(input(0)), '\(op.propertyName)'")
+        case .deleteProperty(let op):
+            w.emit("\(output()) <- DeleteProperty \(input(0)), '\(op.propertyName)'")
 
-        case let op as ConfigureProperty:
-            w.emit("ConfigureProperty \(input(0)), '\(op.propertyName)', '\(op.flags)', '\(op.type)' [\(instr.inputs.suffix(from: 1))]")
+        case .configureProperty(let op):
+            w.emit("ConfigureProperty \(input(0)), '\(op.propertyName)', '\(op.flags)', '\(op.type)' [\(instr.inputs.suffix(from: 1).map(lift))]")
 
-        case let op as LoadElement:
-            w.emit("\(instr.output) <- LoadElement \(input(0)), '\(op.index)'")
+        case .getElement(let op):
+            w.emit("\(output()) <- GetElement \(input(0)), '\(op.index)'")
 
-        case let op as StoreElement:
-            w.emit("StoreElement \(input(0)), '\(op.index)', \(input(1))")
+        case .setElement(let op):
+            w.emit("SetElement \(input(0)), '\(op.index)', \(input(1))")
 
-        case let op as StoreElementWithBinop:
-            w.emit("\(instr.input(0)) <- StoreElementWithBinop '\(op.index)', '\(op.op.token)', \(input(1))")
+        case .updateElement(let op):
+            w.emit("\(instr.input(0)) <- UpdateElement '\(op.index)', '\(op.op.token)', \(input(1))")
 
-        case let op as DeleteElement:
-            w.emit("\(instr.output) <- DeleteElement \(input(0)), '\(op.index)'")
+        case .deleteElement(let op):
+            w.emit("\(output()) <- DeleteElement \(input(0)), '\(op.index)'")
 
-        case let op as ConfigureElement:
-            w.emit("ConfigureElement \(input(0)), '\(op.index)', '\(op.flags)', '\(op.type)' [\(instr.inputs.suffix(from: 1))]")
+        case .configureElement(let op):
+            w.emit("ConfigureElement \(input(0)), '\(op.index)', '\(op.flags)', '\(op.type)' [\(instr.inputs.suffix(from: 1).map(lift))]")
 
-        case is LoadComputedProperty:
-            w.emit("\(instr.output) <- LoadComputedProperty \(input(0)), \(input(1))")
+        case .getComputedProperty:
+            w.emit("\(output()) <- GetComputedProperty \(input(0)), \(input(1))")
 
-        case is StoreComputedProperty:
-            w.emit("StoreComputedProperty \(input(0)), \(input(1)), \(input(2))")
+        case .setComputedProperty:
+            w.emit("SetComputedProperty \(input(0)), \(input(1)), \(input(2))")
 
-        case let op as StoreComputedPropertyWithBinop:
-            w.emit("StoreComputedPropertyWithBinop \(input(0)), \(input(1)), '\(op.op.token)',\(input(2))")
+        case .updateComputedProperty(let op):
+            w.emit("UpdateComputedProperty \(input(0)), \(input(1)), '\(op.op.token)',\(input(2))")
 
-        case is DeleteComputedProperty:
-            w.emit("\(instr.output) <- DeleteComputedProperty \(input(0)), \(input(1))")
+        case .deleteComputedProperty:
+            w.emit("\(output()) <- DeleteComputedProperty \(input(0)), \(input(1))")
 
-        case let op as ConfigureComputedProperty:
-            w.emit("ConfigureComputedProperty \(input(0)), \(input(1)), '\(op.flags)', '\(op.type)' [\(instr.inputs.suffix(from: 2))]")
+        case .configureComputedProperty(let op):
+            w.emit("ConfigureComputedProperty \(input(0)), \(input(1)), '\(op.flags)', '\(op.type)' [\(instr.inputs.suffix(from: 2).map(lift))]")
 
-        case is TypeOf:
-            w.emit("\(instr.output) <- TypeOf \(input(0))")
+        case .typeOf:
+            w.emit("\(output()) <- TypeOf \(input(0))")
 
-        case is TestInstanceOf:
-            w.emit("\(instr.output) <- TestInstanceOf \(input(0)), \(input(1))")
+        case .testInstanceOf:
+            w.emit("\(output()) <- TestInstanceOf \(input(0)), \(input(1))")
 
-        case is TestIn:
-            w.emit("\(instr.output) <- TestIn \(input(0)), \(input(1))")
+        case .testIn:
+            w.emit("\(output()) <- TestIn \(input(0)), \(input(1))")
 
-        case let op as BeginAnyFunction:
-            let params = instr.innerOutputs.map({ $0.identifier }).joined(separator: ", ")
-            w.emit("\(instr.output) <- \(op.name) -> \(params)\(op.isStrict ? ", strict" : "")")
+        case .beginPlainFunction(let op as BeginAnyFunction),
+             .beginArrowFunction(let op as BeginAnyFunction),
+             .beginGeneratorFunction(let op as BeginAnyFunction),
+             .beginAsyncFunction(let op as BeginAnyFunction),
+             .beginAsyncArrowFunction(let op as BeginAnyFunction),
+             .beginAsyncGeneratorFunction(let op as BeginAnyFunction):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("\(output()) <- \(op.name) -> \(params)\(op.isStrict ? ", strict" : "")")
             w.increaseIndentionLevel()
 
-        case let op as EndAnyFunction:
+        case .endPlainFunction(let op as EndAnyFunction),
+             .endArrowFunction(let op as EndAnyFunction),
+             .endGeneratorFunction(let op as EndAnyFunction),
+             .endAsyncFunction(let op as EndAnyFunction),
+             .endAsyncArrowFunction(let op as EndAnyFunction),
+             .endAsyncGeneratorFunction(let op as EndAnyFunction):
             w.decreaseIndentionLevel()
             w.emit("\(op.name)")
 
-        case let op as BeginConstructor:
-            let params = instr.innerOutputs.map({ $0.identifier }).joined(separator: ", ")
-            w.emit("\(instr.output) <- \(op.name) -> \(params)")
+        case .beginConstructor(let op):
+            let params = instr.innerOutputs.map(lift).joined(separator: ", ")
+            w.emit("\(output()) <- \(op.name) -> \(params)")
             w.increaseIndentionLevel()
 
-        case let op as EndConstructor:
+        case .endConstructor(let op):
             w.decreaseIndentionLevel()
             w.emit("\(op.name)")
 
-        case is Return:
-            w.emit("Return \(input(0))")
-
-        case is Yield:
-            w.emit("\(instr.output) <- Yield \(input(0))")
-
-        case is YieldEach:
-            w.emit("YieldEach \(input(0))")
-
-        case is Await:
-            w.emit("\(instr.output) <- Await \(input(0))")
-
-        case is CallFunction:
-            w.emit("\(instr.output) <- CallFunction \(input(0)), [\(liftCallArguments(instr.variadicInputs))]")
-
-        case let op as CallFunctionWithSpread:
-            w.emit("\(instr.output) <- CallFunctionWithSpread \(input(0)), [\(liftCallArguments(instr.variadicInputs, spreading: op.spreads))]")
-
-        case is Construct:
-            w.emit("\(instr.output) <- Construct \(input(0)), [\(liftCallArguments(instr.variadicInputs))]")
-
-        case let op as ConstructWithSpread:
-            w.emit("\(instr.output) <- ConstructWithSpread \(input(0)), [\(liftCallArguments(instr.variadicInputs, spreading: op.spreads))]")
-
-        case let op as CallMethod:
-            w.emit("\(instr.output) <- CallMethod \(input(0)), '\(op.methodName)', [\(liftCallArguments(instr.variadicInputs))]")
-
-        case let op as CallMethodWithSpread:
-            w.emit("\(instr.output) <- CallMethodWithSpread \(input(0)), '\(op.methodName)', [\(liftCallArguments(instr.variadicInputs, spreading: op.spreads))]")
-
-        case is CallComputedMethod:
-            w.emit("\(instr.output) <- CallComputedMethod \(input(0)), \(input(1)), [\(liftCallArguments(instr.variadicInputs))]")
-
-        case let op as CallComputedMethodWithSpread:
-            w.emit("\(instr.output) <- CallComputedMethodWithSpread \(input(0)), \(input(1)), [\(liftCallArguments(instr.variadicInputs, spreading: op.spreads))]")
-
-        case let op as UnaryOperation:
-            if op.op.isPostfix {
-                w.emit("\(instr.output) <- UnaryOperation \(input(0)), '\(op.op.token)'")
+        case .return(let op):
+            if op.hasReturnValue {
+                w.emit("Return \(input(0))")
             } else {
-                w.emit("\(instr.output) <- UnaryOperation '\(op.op.token)', \(input(0))")
+                w.emit("Return")
             }
 
-        case let op as BinaryOperation:
-            w.emit("\(instr.output) <- BinaryOperation \(input(0)), '\(op.op.token)', \(input(1))")
+        case .yield(let op):
+            if op.hasArgument {
+                w.emit("\(output()) <- Yield \(input(0))")
+            } else {
+                w.emit("\(output()) <- Yield")
+            }
 
-        case let op as ReassignWithBinop:
-            w.emit("\(instr.input(0)) <- ReassignWithBinop '\(op.op.token)', \(input(1))")
+        case .yieldEach:
+            w.emit("YieldEach \(input(0))")
 
-        case is Dup:
-            w.emit("\(instr.output) <- Dup \(input(0))")
+        case .await:
+            w.emit("\(output()) <- Await \(input(0))")
 
-        case is Reassign:
+        case .callFunction:
+            w.emit("\(output()) <- CallFunction \(input(0)), [\(liftCallArguments(instr.variadicInputs))]")
+
+        case .callFunctionWithSpread(let op):
+            w.emit("\(output()) <- CallFunctionWithSpread \(input(0)), [\(liftCallArguments(instr.variadicInputs, spreading: op.spreads))]")
+
+        case .construct:
+            w.emit("\(output()) <- Construct \(input(0)), [\(liftCallArguments(instr.variadicInputs))]")
+
+        case .constructWithSpread(let op):
+            w.emit("\(output()) <- ConstructWithSpread \(input(0)), [\(liftCallArguments(instr.variadicInputs, spreading: op.spreads))]")
+
+        case .callMethod(let op):
+            w.emit("\(output()) <- CallMethod \(input(0)), '\(op.methodName)', [\(liftCallArguments(instr.variadicInputs))]")
+
+        case .callMethodWithSpread(let op):
+            w.emit("\(output()) <- CallMethodWithSpread \(input(0)), '\(op.methodName)', [\(liftCallArguments(instr.variadicInputs, spreading: op.spreads))]")
+
+        case .callComputedMethod:
+            w.emit("\(output()) <- CallComputedMethod \(input(0)), \(input(1)), [\(liftCallArguments(instr.variadicInputs))]")
+
+        case .callComputedMethodWithSpread(let op):
+            w.emit("\(output()) <- CallComputedMethodWithSpread \(input(0)), \(input(1)), [\(liftCallArguments(instr.variadicInputs, spreading: op.spreads))]")
+
+        case .unaryOperation(let op):
+            if op.op.isPostfix {
+                w.emit("\(output()) <- UnaryOperation \(input(0)), '\(op.op.token)'")
+            } else {
+                w.emit("\(output()) <- UnaryOperation '\(op.op.token)', \(input(0))")
+            }
+
+        case .binaryOperation(let op):
+            w.emit("\(output()) <- BinaryOperation \(input(0)), '\(op.op.token)', \(input(1))")
+
+        case .ternaryOperation:
+            w.emit("\(output()) <- TernaryOperation \(input(0)), \(input(1)), \(input(2))")
+
+        case .reassign:
             w.emit("Reassign \(input(0)), \(input(1))")
 
-        case let op as DestructArray:
-            let outputs = instr.outputs.map({ $0.identifier })
-            w.emit("[\(liftArrayPattern(indices: op.indices, outputs: outputs, hasRestElement: op.hasRestElement))] <- DestructArray \(input(0))")
+        case .update(let op):
+            w.emit("Update \(instr.input(0)), '\(op.op.token)', \(input(1))")
 
-        case let op as DestructArrayAndReassign:
-            let outputs = instr.inputs.dropFirst().map({ $0.identifier })
-            w.emit("[\(liftArrayPattern(indices: op.indices, outputs: outputs, hasRestElement: op.hasRestElement))] <- DestructArrayAndReassign \(input(0))")
+        case .dup:
+            w.emit("\(output()) <- Dup \(input(0))")
 
-        case let op as DestructObject:
-            let outputs = instr.outputs.map({ $0.identifier })
+        case .destructArray(let op):
+            let outputs = instr.outputs.map(lift)
+            w.emit("[\(liftArrayDestructPattern(indices: op.indices, outputs: outputs, hasRestElement: op.lastIsRest))] <- DestructArray \(input(0))")
+
+        case .destructArrayAndReassign(let op):
+            let outputs = instr.inputs.dropFirst().map(lift)
+            w.emit("[\(liftArrayDestructPattern(indices: op.indices, outputs: outputs, hasRestElement: op.lastIsRest))] <- DestructArrayAndReassign \(input(0))")
+
+        case .destructObject(let op):
+            let outputs = instr.outputs.map(lift)
             w.emit("{\(liftObjectDestructPattern(properties: op.properties, outputs: outputs, hasRestElement: op.hasRestElement))} <- DestructObject \(input(0))")
 
-        case let op as DestructObjectAndReassign:
-            let outputs = instr.inputs.dropFirst().map({ $0.identifier })
+        case .destructObjectAndReassign(let op):
+            let outputs = instr.inputs.dropFirst().map(lift)
             w.emit("{\(liftObjectDestructPattern(properties: op.properties, outputs: outputs, hasRestElement: op.hasRestElement))} <- DestructObjectAndReassign \(input(0))")
 
-        case let op as Compare:
-            w.emit("\(instr.output) <- Compare \(input(0)), '\(op.op.token)', \(input(1))")
+        case .compare(let op):
+            w.emit("\(output()) <- Compare \(input(0)), '\(op.op.token)', \(input(1))")
 
-        case is ConditionalOperation:
-            w.emit("\(instr.output) <- ConditionalOperation \(input(0)), \(input(1)), \(input(2))")
+        case .loadNamedVariable(let op):
+            w.emit("\(output()) <- LoadNamedVariable '\(op.variableName)'")
 
-        case let op as Eval:
-            let args = instr.inputs.map({ $0.identifier }).joined(separator: ", ")
-            w.emit("Eval '\(op.code)', [\(args)]")
+        case .storeNamedVariable(let op):
+            w.emit("StoreNamedVariable '\(op.variableName)' <- \(input(0))")
 
-        case is Explore:
-            let arguments = instr.inputs.suffix(from: 1).map({ $0.identifier }).joined(separator: ", ")
+        case .defineNamedVariable(let op):
+            w.emit("DefineNamedVariable '\(op.variableName)' <- \(input(0))")
+
+        case .eval(let op):
+            let args = instr.inputs.map(lift).joined(separator: ", ")
+            if op.hasOutput {
+                w.emit("\(output()) <- Eval '\(op.code)', [\(args)]")
+            } else {
+                w.emit("Eval '\(op.code)', [\(args)]")
+            }
+
+        case .explore:
+            let arguments = instr.inputs.suffix(from: 1).map(lift).joined(separator: ", ")
             w.emit("Explore \(instr.input(0)), [\(arguments)]")
 
-        case is Probe:
+        case .probe:
             w.emit("Probe \(instr.input(0))")
 
-        case is BeginWith:
+        case .beginWith:
             w.emit("BeginWith \(input(0))")
             w.increaseIndentionLevel()
 
-        case is EndWith:
+        case .endWith:
             w.decreaseIndentionLevel()
             w.emit("EndWith")
 
-        case let op as LoadFromScope:
-            w.emit("\(instr.output) <- LoadFromScope '\(op.id)'")
-
-        case let op as StoreToScope:
-            w.emit("StoreToScope '\(op.id)', \(input(0))")
-
-        case is Nop:
+        case .nop:
             w.emit("Nop")
 
-        case let op as BeginIf:
+        case .beginIf(let op):
             let mode = op.inverted ? "(inverted) " : ""
             w.emit("BeginIf \(mode)\(input(0))")
             w.increaseIndentionLevel()
 
-        case is BeginElse:
+        case .beginElse:
             w.decreaseIndentionLevel()
             w.emit("BeginElse")
             w.increaseIndentionLevel()
 
-        case is EndIf:
+        case .endIf:
             w.decreaseIndentionLevel()
             w.emit("EndIf")
 
-        case is BeginSwitch:
-            w.emit("BeginSwitch \(input(0).description)")
+        case .beginSwitch:
+            w.emit("BeginSwitch \(input(0))")
             w.increaseIndentionLevel()
 
-        case is BeginSwitchCase:
-            w.emit("BeginSwitchCase \(input(0).description)")
+        case .beginSwitchCase:
+            w.emit("BeginSwitchCase \(input(0))")
             w.increaseIndentionLevel()
 
-        case is BeginSwitchDefaultCase:
+        case .beginSwitchDefaultCase:
             w.emit("BeginSwitchDefaultCase")
             w.increaseIndentionLevel()
 
-        case let op as EndSwitchCase:
+        case .endSwitchCase(let op):
             w.decreaseIndentionLevel()
             w.emit("EndSwitchCase \(op.fallsThrough ? "fallsThrough" : "")")
 
-        case is EndSwitch:
+        case .endSwitch:
             w.decreaseIndentionLevel()
             w.emit("EndSwitch")
 
-       case let op as BeginClass:
-           var line = "\(instr.output) <- BeginClass"
-           if instr.hasInputs {
-               line += " \(input(0)),"
-           }
-           line += " \(op.instanceProperties),"
-           line += " \(Array(op.instanceMethods.map({ $0.name })))"
-           w.emit(line)
-           w.increaseIndentionLevel()
-
-       case is BeginMethod:
-           w.decreaseIndentionLevel()
-           let params = instr.innerOutputs.map({ $0.identifier }).joined(separator: ", ")
-           w.emit("BeginMethod -> \(params)")
-           w.increaseIndentionLevel()
-
-       case is EndClass:
-           w.decreaseIndentionLevel()
-           w.emit("EndClass")
-
-       case is CallSuperConstructor:
+        case .callSuperConstructor:
            w.emit("CallSuperConstructor [\(liftCallArguments(instr.variadicInputs))]")
 
-       case let op as CallSuperMethod:
-           w.emit("\(instr.output) <- CallSuperMethod '\(op.methodName)', [\(liftCallArguments(instr.variadicInputs))]")
+        case .callSuperMethod(let op):
+           w.emit("\(output()) <- CallSuperMethod '\(op.methodName)', [\(liftCallArguments(instr.variadicInputs))]")
 
-       case let op as LoadSuperProperty:
-           w.emit("\(instr.output) <- LoadSuperProperty '\(op.propertyName)'")
+        case .getPrivateProperty(let op):
+           w.emit("\(output()) <- GetPrivateProperty '\(op.propertyName)'")
 
-       case let op as StoreSuperProperty:
-           w.emit("StoreSuperProperty '\(op.propertyName)', \(input(0))")
+        case .setPrivateProperty(let op):
+           w.emit("SetPrivateProperty '\(op.propertyName)', \(input(0))")
 
-        case let op as StoreSuperPropertyWithBinop:
-            w.emit("StoreSuperPropertyWithBinop '\(op.propertyName)', '\(op.op.token)', \(input(0))")
+        case .updatePrivateProperty(let op):
+            w.emit("UpdatePrivateProperty '\(op.propertyName)', '\(op.op.token)', \(input(0))")
 
-        case let op as BeginWhileLoop:
+        case .callPrivateMethod(let op):
+            w.emit("\(output()) <- CallPrivateMethod \(input(0)), '\(op.methodName)', [\(liftCallArguments(instr.variadicInputs))]")
+
+        case .getSuperProperty(let op):
+           w.emit("\(output()) <- GetSuperProperty '\(op.propertyName)'")
+
+        case .setSuperProperty(let op):
+           w.emit("SetSuperProperty '\(op.propertyName)', \(input(0))")
+
+        case .updateSuperProperty(let op):
+            w.emit("UpdateSuperProperty '\(op.propertyName)', '\(op.op.token)', \(input(0))")
+
+        case .beginWhileLoop(let op):
             w.emit("BeginWhileLoop \(input(0)), '\(op.comparator.token)', \(input(1))")
             w.increaseIndentionLevel()
 
-        case is EndWhileLoop:
+        case .endWhileLoop:
             w.decreaseIndentionLevel()
             w.emit("EndWhileLoop")
 
-        case let op as BeginDoWhileLoop:
+        case .beginDoWhileLoop(let op):
             w.emit("BeginDoWhileLoop \(input(0)), '\(op.comparator.token)', \(input(1))")
             w.increaseIndentionLevel()
 
-        case is EndDoWhileLoop:
+        case .endDoWhileLoop:
             w.decreaseIndentionLevel()
             w.emit("EndDoWhileLoop")
 
-        case let op as BeginForLoop:
-            w.emit("BeginForLoop \(input(0)), '\(op.comparator.token)', \(input(1)), '\(op.op.token)', \(input(2)) -> \(instr.innerOutput)")
+        case .beginForLoop(let op):
+            w.emit("BeginForLoop \(input(0)), '\(op.comparator.token)', \(input(1)), '\(op.op.token)', \(input(2)) -> \(innerOutput())")
             w.increaseIndentionLevel()
 
-        case is EndForLoop:
+        case .endForLoop:
             w.decreaseIndentionLevel()
             w.emit("EndForLoop")
 
-        case is BeginForInLoop:
-            w.emit("BeginForInLoop \(input(0)) -> \(instr.innerOutput)")
+        case .beginForInLoop:
+            w.emit("BeginForInLoop \(input(0)) -> \(innerOutput())")
             w.increaseIndentionLevel()
 
-        case is EndForInLoop:
+        case .endForInLoop:
             w.decreaseIndentionLevel()
             w.emit("EndForInLoop")
 
-        case is BeginForOfLoop:
-            w.emit("BeginForOfLoop \(input(0)) -> \(instr.innerOutput)")
+        case .beginForOfLoop:
+            w.emit("BeginForOfLoop \(input(0)) -> \(innerOutput())")
             w.increaseIndentionLevel()
 
-        case let op as BeginForOfWithDestructLoop:
-            let outputs = instr.innerOutputs.map({ $0.identifier })
-            w.emit(" BeginForOfLoop \(input(0)) -> [\(liftArrayPattern(indices: op.indices, outputs: outputs, hasRestElement: op.hasRestElement))]")
+        case .beginForOfWithDestructLoop(let op):
+            let outputs = instr.innerOutputs.map(lift)
+            w.emit("BeginForOfLoop \(input(0)) -> [\(liftArrayDestructPattern(indices: op.indices, outputs: outputs, hasRestElement: op.hasRestElement))]")
             w.increaseIndentionLevel()
 
-        case is EndForOfLoop:
+        case .endForOfLoop:
             w.decreaseIndentionLevel()
             w.emit("EndForOfLoop")
 
-        case let op as BeginRepeatLoop:
-            w.emit("BeginLoop \(op.iterations) -> \(instr.innerOutput)")
+        case .beginRepeatLoop(let op):
+            w.emit("BeginRepeatLoop '\(op.iterations)' -> \(innerOutput())")
             w.increaseIndentionLevel()
 
-        case is EndRepeatLoop:
+        case .endRepeatLoop:
             w.decreaseIndentionLevel()
-            w.emit("EndLoop")
+            w.emit("EndRepeatLoop")
 
-        case is LoopBreak,
-             is SwitchBreak:
+        case .loopBreak,
+             .switchBreak:
             w.emit("Break")
 
-        case is LoopContinue:
+        case .loopContinue:
             w.emit("Continue")
 
-        case is BeginTry:
+        case .beginTry:
             w.emit("BeginTry")
             w.increaseIndentionLevel()
 
-        case is BeginCatch:
+        case .beginCatch:
             w.decreaseIndentionLevel()
-            w.emit("BeginCatch -> \(instr.innerOutput)")
+            w.emit("BeginCatch -> \(innerOutput())")
             w.increaseIndentionLevel()
 
-        case is BeginFinally:
+        case .beginFinally:
             w.decreaseIndentionLevel()
             w.emit("BeginFinally")
             w.increaseIndentionLevel()
 
-        case is EndTryCatchFinally:
+        case .endTryCatchFinally:
             w.decreaseIndentionLevel()
             w.emit("EndTryCatch")
 
-        case is ThrowException:
+        case .throwException:
             w.emit("ThrowException \(input(0))")
 
-        case is BeginCodeString:
-            w.emit("\(instr.output) <- BeginCodeString")
+        case .beginCodeString:
+            w.emit("\(output()) <- BeginCodeString")
             w.increaseIndentionLevel()
 
-        case is EndCodeString:
+        case .endCodeString:
             w.decreaseIndentionLevel()
             w.emit("EndCodeString")
 
-        case is BeginBlockStatement:
+        case .beginBlockStatement:
             w.emit("BeginBlockStatement")
             w.increaseIndentionLevel()
 
-        case is EndBlockStatement:
+        case .endBlockStatement:
             w.decreaseIndentionLevel()
             w.emit("EndBlockStatement")
 
-        case is Print:
+        case .print:
             w.emit("Print \(input(0))")
-
-        default:
-            fatalError("Unhandled Operation: \(type(of: instr.op))")
         }
     }
 
@@ -521,6 +698,48 @@ public class FuzzILLifter: Lifter {
         }
 
         return w.code
+    }
+
+    private func liftCallArguments(_ args: ArraySlice<Variable>, spreading spreads: [Bool] = []) -> String {
+        var arguments = [String]()
+        for (i, v) in args.enumerated() {
+            if spreads.count > i && spreads[i] {
+                arguments.append("...\(lift(v))")
+            } else {
+                arguments.append(lift(v))
+            }
+        }
+        return arguments.joined(separator: ", ")
+    }
+
+    private func liftArrayDestructPattern(indices: [Int64], outputs: [String], hasRestElement: Bool) -> String {
+        assert(indices.count == outputs.count)
+
+        var arrayPattern = ""
+        var lastIndex = 0
+        for (index64, output) in zip(indices, outputs) {
+            let index = Int(index64)
+            let skipped = index - lastIndex
+            lastIndex = index
+            let dots = index == indices.last! && hasRestElement ? "..." : ""
+            arrayPattern += String(repeating: ",", count: skipped) + dots + output
+        }
+
+        return arrayPattern
+    }
+
+    private func liftObjectDestructPattern(properties: [String], outputs: [String], hasRestElement: Bool) -> String {
+        assert(outputs.count == properties.count + (hasRestElement ? 1 : 0))
+
+        var objectPattern = ""
+        for (property, output) in zip(properties, outputs) {
+            objectPattern += "\(property):\(output),"
+        }
+        if hasRestElement {
+            objectPattern += "...\(outputs.last!)"
+        }
+
+        return objectPattern
     }
 }
 

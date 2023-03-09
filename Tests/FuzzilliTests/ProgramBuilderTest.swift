@@ -52,7 +52,7 @@ class ProgramBuilderTests: XCTestCase {
         ])
 
         for _ in 0..<10 {
-            b.build(n: 100, by: .runningGenerators)
+            b.build(n: 100, by: .generating)
             let program = b.finalize()
 
             // In this case, the size of the generated program must be exactly the requested size.
@@ -81,7 +81,7 @@ class ProgramBuilderTests: XCTestCase {
         ])
 
         for _ in 0..<10 {
-            b.build(n: 100, by: .runningGenerators)
+            b.build(n: 100, by: .generating)
             let program = b.finalize()
 
             // Uncomment to see the "shape" of generated programs on the console.
@@ -102,6 +102,154 @@ class ProgramBuilderTests: XCTestCase {
             // generateVariable must be able to generate every type produced by generateType
             let _ = b.generateVariable(ofType: t)
         }
+    }
+
+    func testObjectLiteralBuilding() {
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+
+        let i = b.loadInt(42)
+        let s = b.loadString("baz")
+        b.buildObjectLiteral { obj in
+            XCTAssertIdentical(obj, b.currentObjectLiteral)
+
+            XCTAssertFalse(obj.hasProperty("foo"))
+            obj.addProperty("foo", as: i)
+            XCTAssert(obj.hasProperty("foo"))
+
+            XCTAssertFalse(obj.hasElement(0))
+            obj.addElement(0, as: i)
+            XCTAssert(obj.hasElement(0))
+
+            XCTAssertFalse(obj.hasComputedProperty(s))
+            obj.addComputedProperty(s, as: i)
+            XCTAssert(obj.hasComputedProperty(s))
+
+            XCTAssertFalse(obj.hasPrototype)
+            obj.setPrototype(to: i)
+            XCTAssert(obj.hasPrototype)
+
+            XCTAssertFalse(obj.hasMethod("bar"))
+            obj.addMethod("bar", with: .parameters(n: 0)) { args in }
+            XCTAssert(obj.hasMethod("bar"))
+
+            XCTAssertFalse(obj.hasGetter(for: "foobar"))
+            obj.addGetter(for: "foobar") { this in }
+            XCTAssert(obj.hasGetter(for: "foobar"))
+
+            XCTAssertFalse(obj.hasSetter(for: "foobar"))
+            obj.addSetter(for: "foobar") { this, v in }
+            XCTAssert(obj.hasSetter(for: "foobar"))
+
+            XCTAssertIdentical(obj, b.currentObjectLiteral)
+        }
+
+        let program = b.finalize()
+        XCTAssertEqual(program.size, 14)
+    }
+
+    func testClassDefinitionBuilding() {
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+
+        let i = b.loadInt(42)
+        let s = b.loadString("baz")
+        let c = b.buildClassDefinition { cls in
+            XCTAssertIdentical(cls, b.currentClassDefinition)
+
+            XCTAssertFalse(cls.isDerivedClass)
+
+            XCTAssertFalse(cls.hasInstanceProperty("foo"))
+            cls.addInstanceProperty("foo", value: i)
+            XCTAssert(cls.hasInstanceProperty("foo"))
+
+            XCTAssertFalse(cls.hasInstanceElement(0))
+            cls.addInstanceElement(0)
+            XCTAssert(cls.hasInstanceElement(0))
+
+            XCTAssertFalse(cls.hasInstanceComputedProperty(s))
+            cls.addInstanceComputedProperty(s, value: i)
+            XCTAssert(cls.hasInstanceComputedProperty(s))
+
+            XCTAssertFalse(cls.hasInstanceMethod("bar"))
+            cls.addInstanceMethod("bar", with: .parameters(n: 0)) { args in }
+            XCTAssert(cls.hasInstanceMethod("bar"))
+
+            XCTAssertFalse(cls.hasInstanceGetter(for: "foobar"))
+            cls.addInstanceGetter(for: "foobar") { this in }
+            XCTAssert(cls.hasInstanceGetter(for: "foobar"))
+
+            XCTAssertFalse(cls.hasInstanceSetter(for: "foobar"))
+            cls.addInstanceSetter(for: "foobar") { this, v in }
+            XCTAssert(cls.hasInstanceSetter(for: "foobar"))
+
+            XCTAssertFalse(cls.hasStaticProperty("foo"))
+            cls.addStaticProperty("foo", value: i)
+            XCTAssert(cls.hasStaticProperty("foo"))
+
+            XCTAssertFalse(cls.hasStaticElement(0))
+            cls.addStaticElement(0)
+            XCTAssert(cls.hasStaticElement(0))
+
+            XCTAssertFalse(cls.hasStaticComputedProperty(s))
+            cls.addStaticComputedProperty(s, value: i)
+            XCTAssert(cls.hasStaticComputedProperty(s))
+
+            XCTAssertFalse(cls.hasStaticMethod("bar"))
+            cls.addStaticMethod("bar", with: .parameters(n: 0)) { args in }
+            XCTAssert(cls.hasStaticMethod("bar"))
+
+            XCTAssertFalse(cls.hasStaticGetter(for: "foobar"))
+            cls.addStaticGetter(for: "foobar") { this in }
+            XCTAssert(cls.hasStaticGetter(for: "foobar"))
+
+            XCTAssertFalse(cls.hasStaticSetter(for: "foobar"))
+            cls.addStaticSetter(for: "foobar") { this, v in }
+            XCTAssert(cls.hasStaticSetter(for: "foobar"))
+
+            // All private fields, regardless of whether they are per-instance or static and whether they are properties or methods use the
+            // namespace and each entry must be unique in that namespace. For example, there cannot be both a `#foo` and `static #foo` field.
+            // However, for the purpose of selecting candidates for private property access and private method calls, we also track fields and methods separately.
+            XCTAssertFalse(cls.hasPrivateField("ifoo"))
+            XCTAssertFalse(cls.hasPrivateProperty("ifoo"))
+            cls.addPrivateInstanceProperty("ifoo", value: i)
+            XCTAssert(cls.hasPrivateField("ifoo"))
+            XCTAssert(cls.hasPrivateProperty("ifoo"))
+
+            XCTAssertFalse(cls.hasPrivateField("ibar"))
+            XCTAssertFalse(cls.hasPrivateMethod("ibar"))
+            cls.addPrivateInstanceMethod("ibar", with: .parameters(n: 0)) { args in }
+            XCTAssert(cls.hasPrivateField("ibar"))
+            XCTAssert(cls.hasPrivateMethod("ibar"))
+
+            XCTAssertFalse(cls.hasPrivateField("sfoo"))
+            XCTAssertFalse(cls.hasPrivateProperty("sfoo"))
+            cls.addPrivateStaticProperty("sfoo", value: i)
+            XCTAssert(cls.hasPrivateField("sfoo"))
+            XCTAssert(cls.hasPrivateProperty("sfoo"))
+
+            XCTAssertFalse(cls.hasPrivateField("sbar"))
+            XCTAssertFalse(cls.hasPrivateMethod("sbar"))
+            cls.addPrivateStaticMethod("sbar", with: .parameters(n: 0)) { args in }
+            XCTAssert(cls.hasPrivateField("sbar"))
+            XCTAssert(cls.hasPrivateMethod("sbar"))
+
+            XCTAssertEqual(cls.existingPrivateProperties, ["ifoo", "sfoo"])
+            XCTAssertEqual(cls.existingPrivateMethods, ["ibar", "sbar"])
+
+            XCTAssertIdentical(cls, b.currentClassDefinition)
+        }
+
+        b.buildClassDefinition(withSuperclass: c) { cls in
+            XCTAssert(cls.isDerivedClass)
+        }
+
+        b.buildClassDefinition(withSuperclass: nil) { cls in
+            XCTAssertFalse(cls.isDerivedClass)
+        }
+
+        let program = b.finalize()
+        XCTAssertEqual(program.size, 32)
     }
 
     func testVariableReuse() {
@@ -136,68 +284,19 @@ class ProgramBuilderTests: XCTestCase {
         XCTAssertNotEqual(floatOutOfScope!, float3)     // Variable went out of scope
     }
 
-    func testVarRetrievalFromInnermostScope() {
-        let fuzzer = makeMockFuzzer()
-        let b = fuzzer.makeBuilder()
-
-        b.blockStatement {
-            b.blockStatement {
-                b.blockStatement {
-                    let innermostVar = b.loadInt(1)
-                    XCTAssertEqual(b.randVar(), innermostVar)
-                    XCTAssertEqual(b.randVarInternal(excludeInnermostScope: true), nil)
-                }
-            }
-        }
-    }
-
-    func testVarRetrievalFromOuterScope() {
-        let fuzzer = makeMockFuzzer()
-        let b = fuzzer.makeBuilder()
-
-        b.blockStatement {
-            b.blockStatement {
-                let outerScopeVar = b.loadFloat(13.37)
-                b.blockStatement {
-                    let _ = b.loadInt(100)
-                    XCTAssertEqual(b.randVar(excludeInnermostScope: true), outerScopeVar)
-                }
-            }
-        }
-    }
-
-    func testRandVarInternal() {
+    func testRandomVarableInternal() {
         let fuzzer = makeMockFuzzer()
         let b = fuzzer.makeBuilder()
 
         b.blockStatement {
             let var1 = b.loadString("HelloWorld")
-            XCTAssertEqual(b.randVarInternal(filter: { $0 == var1 }), var1)
+            XCTAssertEqual(b.randomVariableInternal(filter: { $0 == var1 }), var1)
             b.blockStatement {
                 let var2 = b.loadFloat(13.37)
-                XCTAssertEqual(b.randVarInternal(filter: { $0 == var2 }), var2)
+                XCTAssertEqual(b.randomVariableInternal(filter: { $0 == var2 }), var2)
                 b.blockStatement {
                     let var3 = b.loadInt(100)
-                    XCTAssertEqual(b.randVarInternal(filter: { $0 == var3 }), var3)
-                }
-            }
-        }
-    }
-
-    func testRandVarInternalFromOuterScope() {
-        let fuzzer = makeMockFuzzer()
-        let b = fuzzer.makeBuilder()
-
-        let var0 = b.loadInt(1337)
-        b.blockStatement {
-            let var1 = b.loadString("HelloWorld")
-            XCTAssertEqual(b.randVarInternal(filter: { $0 == var0 }, excludeInnermostScope : true), var0)
-            b.blockStatement {
-                let var2 = b.loadFloat(13.37)
-                XCTAssertEqual(b.randVarInternal(filter: { $0 == var1 }, excludeInnermostScope : true), var1)
-                b.blockStatement {
-                    let _ = b.loadInt(100)
-                    XCTAssertEqual(b.randVarInternal(filter: { $0 == var2 }, excludeInnermostScope : true), var2)
+                    XCTAssertEqual(b.randomVariableInternal(filter: { $0 == var3 }), var3)
                 }
             }
         }
@@ -255,7 +354,7 @@ class ProgramBuilderTests: XCTestCase {
         }
         b.loadFloat(13.37)
         var arr = b.createArray(with: [i, i, i])
-        b.loadProperty("length", of: arr)
+        b.getProperty("length", of: arr)
         splicePoint = b.indexOfNextInstruction()
         b.callMethod("pop", on: arr, withArgs: [])
         let original = b.finalize()
@@ -309,11 +408,11 @@ class ProgramBuilderTests: XCTestCase {
         var f = b.loadFloat(13.37)
         var f2 = b.loadFloat(133.7)
         let o = b.createObject(with: ["f": f])
-        b.storeProperty(f2, as: "f", on: o)
+        b.setProperty("f", of: o, to: f2)
         b.buildWhileLoop(i, .lessThan, b.loadInt(100)) {
             b.binary(f, f2, with: .Add)
         }
-        b.loadProperty("f", of: o)
+        b.getProperty("f", of: o)
         let original = b.finalize()
 
         //
@@ -795,7 +894,7 @@ class ProgramBuilderTests: XCTestCase {
         let name = b.loadString("foo")
         let obj = b.createObject(with: [:])
         splicePoint = b.indexOfNextInstruction()
-        b.storeComputedProperty(v, as: name, on: obj)
+        b.setComputedProperty(name, of: obj, to: v)
         let original = b.finalize()
 
         // If we set the probability of remapping a variables outputs during splicing to 100% we expect
@@ -809,8 +908,8 @@ class ProgramBuilderTests: XCTestCase {
         XCTAssert(b.splice(from: original, at: splicePoint, mergeDataFlow: true))
         let result = b.finalize()
 
-        XCTAssertEqual(result.size, 4)
-        XCTAssert(result.code.lastInstruction.op is StoreComputedProperty)
+        XCTAssertEqual(result.size, 5)
+        XCTAssert(result.code.lastInstruction.op is SetComputedProperty)
     }
 
     func testDataflowSplicing4() {
@@ -964,6 +1063,188 @@ class ProgramBuilderTests: XCTestCase {
         XCTAssertEqual(actual, expected)
     }
 
+    func testObjectLiteralSplicing1() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+
+        //
+        // Original Program
+        //
+        let v = b.loadInt(42)
+        let p = b.loadString("foobar")
+        let o = b.buildObjectLiteral { obj in
+            obj.addElement(0, as: v)
+            obj.addComputedProperty(p, as: v)
+        }
+        splicePoint = b.indexOfNextInstruction()
+        b.getProperty("foobar", of: o)
+        let original = b.finalize()
+
+        //
+        // Actual Program
+        //
+        b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+        let actual = b.finalize()
+
+        XCTAssertEqual(actual, original)
+    }
+
+    func testObjectLiteralSplicing2() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+
+        //
+        // Original Program
+        //
+        let v = b.loadInt(42)
+        b.buildObjectLiteral { obj in
+            obj.addProperty("foo", as: v)
+            splicePoint = b.indexOfNextInstruction()
+            obj.addGetter(for: "baz") { this in
+                b.doReturn(b.loadString("baz"))
+            }
+        }
+        let original = b.finalize()
+
+        //
+        // Actual Program
+        //
+        var foo = b.loadString("foo")
+        var bar = b.loadString("bar")
+        b.buildObjectLiteral { obj in
+            obj.addElement(0, as: foo)
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            obj.addElement(1, as: bar)
+        }
+        let actual = b.finalize()
+
+        //
+        // Expected Program
+        //
+        foo = b.loadString("foo")
+        bar = b.loadString("bar")
+        b.buildObjectLiteral { obj in
+            obj.addElement(0, as: foo)
+            obj.addGetter(for: "baz") { this in
+                b.doReturn(b.loadString(("baz")))
+            }
+            obj.addElement(1, as: bar)
+        }
+        let expected = b.finalize()
+
+        XCTAssertEqual(actual, expected)
+    }
+
+    func testObjectLiteralSplicing3() {
+        // This tests that the object variable, which is an output of the EndObjectLiteral
+        // instruction (not the BeginObjectLiteral!) is properly handled during splicing.
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+
+        //
+        // Original Program
+        //
+        let f = b.buildPlainFunction(with: .parameters(n: 2)) { args in
+            let o = b.buildObjectLiteral { obj in
+                obj.addProperty("x", as: args[0])
+                obj.addProperty("y", as: args[1])
+            }
+            b.doReturn(o)
+        }
+        let v = b.loadInt(42)
+        splicePoint = b.indexOfNextInstruction()
+        b.callFunction(f, withArgs: [v, v])
+        let original = b.finalize()
+
+        //
+        // Actual Program
+        //
+        b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+        let actual = b.finalize()
+
+        XCTAssertEqual(actual, original)
+    }
+
+    func testClassDefinitionSplicing1() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+
+        //
+        // Original Program
+        //
+        let v = b.loadInt(1337)
+        let c = b.buildClassDefinition { cls in
+            cls.addInstanceProperty("foo", value: v)
+            cls.addStaticProperty("bar")
+            cls.addInstanceElement(0)
+        }
+        splicePoint = b.indexOfNextInstruction()
+        b.construct(c, withArgs: [])
+        let original = b.finalize()
+
+        //
+        // Actual Program
+        //
+        b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+        let actual = b.finalize()
+
+        XCTAssertEqual(actual, original)
+    }
+
+    func testClassDefinitionSplicing2() {
+        var splicePoint1 = -1, splicePoint2 = -1
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+
+        //
+        // Original Program
+        //
+        b.buildClassDefinition { cls in
+            cls.addInstanceProperty("foo")
+            cls.addConstructor(with: .parameters(n: 1)) { args in
+                let this = args[0]
+                b.setProperty("foo", of: this, to: args[1])
+            }
+            splicePoint1 = b.indexOfNextInstruction()
+            cls.addInstanceMethod("bar", with: .parameters(n: 0)) { args in
+                let this = args[0]
+                let one = b.loadInt(1)
+                b.updateProperty("count", of: this, with: one, using: .Add)
+            }
+            splicePoint2 = b.indexOfNextInstruction()
+            cls.addStaticElement(42)
+        }
+        let original = b.finalize()
+
+        //
+        // Actual Program
+        //
+        b.buildClassDefinition { cls in
+            b.splice(from: original, at: splicePoint1, mergeDataFlow: false)
+            b.splice(from: original, at: splicePoint2, mergeDataFlow: false)
+        }
+        let actual = b.finalize()
+
+        //
+        // Expected Program
+        //
+        b.buildClassDefinition { cls in
+            cls.addInstanceMethod("bar", with: .parameters(n: 0)) { args in
+                let this = args[0]
+                let one = b.loadInt(1)
+                b.updateProperty("count", of: this, with: one, using: .Add)
+            }
+            cls.addStaticElement(42)
+        }
+        let expected = b.finalize()
+
+        XCTAssertEqual(actual, expected)
+    }
+
     func testFunctionSplicing1() {
         var splicePoint = -1
         let fuzzer = makeMockFuzzer()
@@ -1064,7 +1345,7 @@ class ProgramBuilderTests: XCTestCase {
             let o = b.createObject(with: ["i": i, "f": f])
             let o2 = b.createObject(with: ["i": i, "f": f2])
             b.binary(i, args[0], with: .Add)
-            b.storeProperty(f2, as: "f", on: o)
+            b.setProperty("f", of: o, to: f2)
             let object = b.loadBuiltin("Object")
             let descriptor = b.createObject(with: ["value": b.loadString("foobar")])
             b.callMethod("defineProperty", on: object, withArgs: [o, b.loadString("s"), descriptor])
@@ -1090,7 +1371,7 @@ class ProgramBuilderTests: XCTestCase {
         let f = b.loadFloat(13.37)
         b.reassign(f2, to: b.loadFloat(133.7))      // (Possibly) mutating instruction must be included
         let o = b.createObject(with: ["i": i, "f": f])
-        b.storeProperty(f2, as: "f", on: o)     // (Possibly) mutating instruction must be included
+        b.setProperty("f", of: o, to: f2)     // (Possibly) mutating instruction must be included
         let object = b.loadBuiltin("Object")
         let descriptor = b.createObject(with: ["value": b.loadString("foobar")])
         b.callMethod("defineProperty", on: object, withArgs: [o, b.loadString("s"), descriptor])    // (Possibly) mutating instruction must be included
@@ -1111,18 +1392,18 @@ class ProgramBuilderTests: XCTestCase {
         //
         // Original Program
         //
-        var superclass = b.buildClass() { cls in
-            cls.defineConstructor(with: .parameters(n: 1)) { params in
+        var superclass = b.buildClassDefinition() { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { params in
             }
 
-            cls.defineProperty("a")
+            //cls.defineProperty("a")
 
-            cls.defineMethod("f", with: .parameters(n: 1)) { params in
+            cls.addInstanceMethod("f", with: .parameters(n: 1)) { params in
                 b.doReturn(b.loadString("foobar"))
             }
         }
-        let _ = b.buildClass(withSuperclass: superclass) { cls in
-            cls.defineConstructor(with: .parameters(n: 1)) { params in
+        let _ = b.buildClassDefinition(withSuperclass: superclass) { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { params in
                 let v3 = b.loadInt(0)
                 let v4 = b.loadInt(2)
                 let v5 = b.loadInt(1)
@@ -1133,9 +1414,9 @@ class ProgramBuilderTests: XCTestCase {
                     b.callSuperConstructor(withArgs: [v1])
                 }
             }
-            cls.defineProperty("b")
+            //cls.defineProperty("b")
 
-            cls.defineMethod("g", with: .parameters(n: 1)) { params in
+            cls.addInstanceMethod("g", with: .parameters(n: 1)) { params in
                 b.buildPlainFunction(with: .parameters(n: 0)) { _ in
                 }
             }
@@ -1145,12 +1426,12 @@ class ProgramBuilderTests: XCTestCase {
         //
         // Actual Program
         //
-        superclass = b.buildClass() { cls in
-            cls.defineConstructor(with: .parameters(n: 1)) { params in
+        superclass = b.buildClassDefinition() { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { params in
             }
         }
-        b.buildClass(withSuperclass: superclass) { cls in
-            cls.defineConstructor(with: .parameters(n: 1)) { _ in
+        b.buildClassDefinition(withSuperclass: superclass) { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { _ in
                 // Splicing at CallSuperConstructor
                 b.splice(from: original, at: splicePoint, mergeDataFlow: false)
             }
@@ -1161,12 +1442,12 @@ class ProgramBuilderTests: XCTestCase {
         //
         // Expected Program
         //
-        superclass = b.buildClass() { cls in
-            cls.defineConstructor(with: .parameters(n: 1)) { params in
+        superclass = b.buildClassDefinition() { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { params in
             }
         }
-        b.buildClass(withSuperclass: superclass) { cls in
-            cls.defineConstructor(with: .parameters(n: 1)) { _ in
+        b.buildClassDefinition(withSuperclass: superclass) { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { _ in
                 let v0 = b.loadInt(42)
                 let v1 = b.createObject(with: ["foo": v0])
                 b.callSuperConstructor(withArgs: [v1])
@@ -1330,7 +1611,7 @@ class ProgramBuilderTests: XCTestCase {
             let i = b.loadInt(1337)
             b.loadString("unusedButPartOfBody")
             splicePoint = b.indexOfNextInstruction()
-            b.storeComputedProperty(i, as: p, on: o2)
+            b.setComputedProperty(p, of: o2, to: i)
         }
         b.loadString("unused")
         let original = b.finalize()
@@ -1352,7 +1633,7 @@ class ProgramBuilderTests: XCTestCase {
         b.buildForInLoop(o1) { p in
             let i = b.loadInt(1337)
             b.loadString("unusedButPartOfBody")
-            b.storeComputedProperty(i, as: p, on: o2)
+            b.setComputedProperty(p, of: o2, to: i)
         }
         let expected = b.finalize()
 
@@ -1416,18 +1697,18 @@ class ProgramBuilderTests: XCTestCase {
         //
         // Actual Program
         //
-        b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+        XCTAssertTrue(b.splice(from: original, at: splicePoint, mergeDataFlow: false))
         let actual = b.finalize()
 
         //
         // Expected Program
         //
         let code = b.buildCodeString() {
-                let i = b.loadInt(42)
-                let o = b.createObject(with: ["i": i])
-                let json = b.loadBuiltin("JSON")
-                b.callMethod("stringify", on: json, withArgs: [o])
-            }
+            let i = b.loadInt(42)
+            let o = b.createObject(with: ["i": i])
+            let json = b.loadBuiltin("JSON")
+            b.callMethod("stringify", on: json, withArgs: [o])
+        }
         let eval = b.reuseOrLoadBuiltin("eval")
         b.callFunction(eval, withArgs: [code])
         let expected = b.finalize()
@@ -1517,50 +1798,5 @@ class ProgramBuilderTests: XCTestCase {
         XCTAssert(result.code.contains(where: { $0.op is BeginSwitchCase }))
         // We must not splice default cases. Otherwise we may end up with multiple default cases, which is forbidden.
         XCTAssertFalse(result.code.contains(where: { $0.op is BeginSwitchDefaultCase }))
-    }
-}
-
-extension ProgramBuilderTests {
-    static var allTests : [(String, (ProgramBuilderTests) -> () throws -> Void)] {
-        return [
-            ("testBuilding", testBuilding),
-            ("testShapeOfGeneratedCode1", testShapeOfGeneratedCode1),
-            ("testShapeOfGeneratedCode2", testShapeOfGeneratedCode2),
-            ("testTypeInstantiation", testTypeInstantiation),
-            ("testVariableReuse", testVariableReuse),
-            ("testVarRetrievalFromInnermostScope", testVarRetrievalFromInnermostScope),
-            ("testVarRetrievalFromOuterScope", testVarRetrievalFromOuterScope),
-            ("testRandVarInternal", testRandVarInternal),
-            ("testRandVarInternalFromOuterScope", testRandVarInternalFromOuterScope),
-            ("testBasicSplicing1", testBasicSplicing1),
-            ("testBasicSplicing2", testBasicSplicing2),
-            ("testBasicSplicing3", testBasicSplicing3),
-            ("testBasicSplicing4", testBasicSplicing4),
-            ("testBasicSplicing5", testBasicSplicing5),
-            ("testBasicSplicing6", testBasicSplicing6),
-            ("testBasicSplicing7", testBasicSplicing7),
-            ("testBasicSplicing8", testBasicSplicing8),
-            ("testBasicSplicing9", testBasicSplicing9),
-            ("testBasicSplicing10", testBasicSplicing10),
-            ("testBasicSplicing11", testBasicSplicing11),
-            ("testDataflowSplicing1", testDataflowSplicing1),
-            ("testDataflowSplicing2", testDataflowSplicing2),
-            ("testDataflowSplicing3", testDataflowSplicing3),
-            ("testDataflowSplicing4", testDataflowSplicing4),
-            ("testDataflowSplicing5", testDataflowSplicing5),
-            ("testDataflowSplicing6", testDataflowSplicing6),
-            ("testFunctionSplicing1", testFunctionSplicing1),
-            ("testFunctionSplicing2", testFunctionSplicing2),
-            ("testSplicingOfMutatingOperations", testSplicingOfMutatingOperations),
-            ("testClassSplicing", testClassSplicing),
-            ("testAsyncGeneratorSplicing", testAsyncGeneratorSplicing),
-            ("testLoopSplicing1", testLoopSplicing1),
-            ("testLoopSplicing2", testLoopSplicing2),
-            ("testForInSplicing", testForInSplicing),
-            ("testTryCatchSplicing", testTryCatchSplicing),
-            ("testCodeStringSplicing", testCodeStringSplicing),
-            ("testSwitchBlockSplicing1", testSwitchBlockSplicing1),
-            ("testSwitchBlockSplicing2", testSwitchBlockSplicing2),
-        ]
     }
 }

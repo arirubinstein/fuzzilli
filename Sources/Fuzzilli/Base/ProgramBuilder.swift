@@ -51,11 +51,6 @@ public class ProgramBuilder {
     /// Counter to quickly determine the next free variable.
     private var numVariables = 0
 
-    /// Property names and integer values previously seen in the current program.
-    private var seenPropertyNames = Set<String>()
-    private var seenIntegers = Set<Int64>()
-    private var seenFloats = Set<Double>()
-
     /// Keep track of existing variables containing known values. For the reuseOrLoadX APIs.
     /// Important: these will contain variables that are no longer in scope. As such, they generally
     /// have to be used in combination with the scope analyzer.
@@ -69,6 +64,29 @@ public class ProgramBuilder {
 
     /// Type inference for JavaScript variables.
     private var jsTyper: JSTyper
+
+    /// Stack of active object literals.
+    ///
+    /// This needs to be a stack as object literals can be nested, for example if an object
+    /// literals is created inside a method/getter/setter of another object literals.
+    private var activeObjectLiterals = Stack<ObjectLiteral>()
+
+    /// When building object literals, the state for the current literal is exposed through this member and
+    /// can be used to add fields to the literal or to determine if some field already exists.
+    public var currentObjectLiteral: ObjectLiteral {
+        return activeObjectLiterals.top
+    }
+
+    /// Stack of active class definitions.
+    ///
+    /// Similar to object literals, class definitions can be nested so this needs to be a stack.
+    private var activeClassDefinitions = Stack<ClassDefinition>()
+
+    /// When building class definitions, the state for the current definition is exposed through this member and
+    /// can be used to add fields to the class or to determine if some field already exists.
+    public var currentClassDefinition: ClassDefinition {
+        return activeClassDefinitions.top
+    }
 
     /// How many variables are currently in scope.
     public var numVisibleVariables: Int {
@@ -94,15 +112,13 @@ public class ProgramBuilder {
         comments.removeAll()
         contributors.removeAll()
         numVariables = 0
-        seenPropertyNames.removeAll()
-        seenIntegers.removeAll()
-        seenFloats.removeAll()
         loadedBuiltins.removeAll()
         loadedIntegers.removeAll()
         loadedFloats.removeAll()
         scopeAnalyzer = ScopeAnalyzer()
         contextAnalyzer = ContextAnalyzer()
         jsTyper.reset()
+        activeObjectLiterals.removeAll()
     }
 
     /// Finalizes and returns the constructed program, then resets this builder so it can be reused for building another program.
@@ -124,7 +140,7 @@ public class ProgramBuilder {
     }
 
     /// Add a trace comment to the currently generated program at the current position.
-    /// This is only done if history inspection is enabled.
+    /// This is only done if inspection is enabled.
     public func trace(_ commentGenerator: @autoclosure () -> String) {
         if fuzzer.config.enableInspection {
             // Use an autoclosure here so that template strings are only evaluated when they are needed.
@@ -140,22 +156,79 @@ public class ProgramBuilder {
         }
     }
 
-    /// Generates a random integer for the current program context.
-    public func genInt() -> Int64 {
-        // Either pick a previously seen integer or generate a random one
-        if probability(0.2) && seenIntegers.count >= 2 {
-            return chooseUniform(from: seenIntegers)
+    ///
+    /// Methods to obtain random values to use in a FuzzIL program.
+    ///
+
+    /// Returns a random integer value.
+    public func randomInt() -> Int64 {
+        if probability(0.5) {
+            return chooseUniform(from: fuzzer.environment.interestingIntegers)
         } else {
             return withEqualProbability({
-                chooseUniform(from: self.fuzzer.environment.interestingIntegers)
+                Int64.random(in: -0x10...0x10)
             }, {
-                Int64.random(in: -0x100000000...0x100000000)
+                Int64.random(in: -0x10000...0x10000)
+            }, {
+                Int64.random(in: Int64(Int32.min)...Int64(Int32.max))
             })
         }
     }
 
-    /// Generates a random regex pattern.
-    public func genRegExp() -> String {
+    /// Returns a random integer value suitable as index.
+    public func randomIndex() -> Int64 {
+        // Prefer small, (usually) positive, indices.
+        if probability(0.5) {
+            return Int64.random(in: -2...10)
+        } else {
+            return randomInt()
+        }
+    }
+
+    /// Returns a random floating point value.
+    public func randomFloat() -> Double {
+        if probability(0.5) {
+            return chooseUniform(from: fuzzer.environment.interestingFloats)
+        } else {
+            return withEqualProbability({
+                Double.random(in: 0.0...1.0)
+            }, {
+                Double.random(in: -10.0...10.0)
+            }, {
+                Double.random(in: -1000.0...1000.0)
+            }, {
+                Double.random(in: -1000000.0...1000000.0)
+            }, {
+                // We cannot do Double.random(in: -Double.greatestFiniteMagnitude...Double.greatestFiniteMagnitude) here,
+                // presumably because that range is larger than what doubles can represent? So split the range in two.
+                if probability(0.5) {
+                    return Double.random(in: -Double.greatestFiniteMagnitude...0)
+                } else {
+                    return Double.random(in: 0...Double.greatestFiniteMagnitude)
+                }
+            })
+        }
+    }
+
+    /// Returns a random string value.
+    public func randomString() -> String {
+        return withEqualProbability({
+            self.randomPropertyName()
+        }, {
+            self.randomMethodName()
+        }, {
+            chooseUniform(from: self.fuzzer.environment.interestingStrings)
+        }, {
+            String(self.randomInt())
+        }, {
+            String.random(ofLength: Int.random(in: 2...10))
+        }, {
+            String.random(ofLength: 1)
+        })
+    }
+
+    /// Returns a random regular expression pattern.
+    public func randomRegExpPattern() -> String {
         // Generate a "base" regexp
         var regex = ""
         let desiredLength = Int.random(in: 1...4)
@@ -169,7 +242,7 @@ public class ProgramBuilder {
 
         // Now optionally concatenate with another regexp
         if probability(0.3) {
-            regex += genRegExp()
+            regex += randomRegExpPattern()
         }
 
         // Or add a quantifier, if there is not already a quantifier in the last position.
@@ -192,90 +265,81 @@ public class ProgramBuilder {
         return regex
     }
 
-    /// Generates a random set of RegExpFlags
-    public func genRegExpFlags() -> RegExpFlags {
-        return RegExpFlags.random()
-    }
-
-    /// Generates a random index value for the current program context.
-    public func genIndex() -> Int64 {
-        return genInt()
-    }
-
-    /// Generates a random integer for the current program context.
-    public func genFloat() -> Double {
-        // TODO improve this
-        if probability(0.2) && seenFloats.count >= 2 {
-            return chooseUniform(from: seenFloats)
-        } else {
-            return withEqualProbability({
-                chooseUniform(from: self.fuzzer.environment.interestingFloats)
-            }, {
-                Double.random(in: -1000000...1000000)
-            })
-        }
-    }
-
-    /// Generates a random string value for the current program context.
-    public func genString() -> String {
-        return withEqualProbability({
-            self.genPropertyNameForRead()
-        }, {
-            chooseUniform(from: self.fuzzer.environment.interestingStrings)
-        }, {
-            String(chooseUniform(from: self.fuzzer.environment.interestingIntegers))
-        }, {
-            String.random(ofLength: Int.random(in: 2...10))
-        }, {
-            String.random(ofLength: 1)
-        })
-    }
-
-    /// Generates a random builtin name for the current program context.
-    public func genBuiltinName() -> String {
+    /// Returns the name of a random builtin.
+    public func randomBuiltin() -> String {
         return chooseUniform(from: fuzzer.environment.builtins)
     }
 
-    /// Generates a random property name for the current program context.
-    public func genPropertyNameForRead() -> String {
-        if probability(0.15) && seenPropertyNames.count >= 2 {
-            return chooseUniform(from: seenPropertyNames)
-        } else {
-            return chooseUniform(from: fuzzer.environment.readPropertyNames)
-        }
+    /// Returns a random builtin property name.
+    ///
+    /// This will return a random name from the environment's list of builtin property names,
+    /// i.e. a property that exists on (at least) one builtin object type.
+    func randomBuiltinPropertyName() -> String {
+        return chooseUniform(from: fuzzer.environment.builtinProperties)
     }
 
-    /// Generates a random property name for the current program context.
-    public func genPropertyNameForWrite() -> String {
-        if probability(0.15) && seenPropertyNames.count >= 2 {
-            return chooseUniform(from: seenPropertyNames)
-        } else {
-            return chooseUniform(from: fuzzer.environment.writePropertyNames)
-        }
+    /// Returns a random custom property name.
+    ///
+    /// This will select a random property from a (usually relatively small) set of custom property names defined by the environment.
+    ///
+    /// This should generally be used in one of two situations:
+    ///   1. If a new property is added to an object.
+    ///     In that case, we prefer to add properties with custom names (e.g. ".a", ".b") instead of properties
+    ///     with names that exist in the environment (e.g. ".length", ".prototype"). This way, in the resulting code
+    ///     it will be fairly clear when a builtin property is accessed vs. a custom one. It also increases the chances
+    ///     of selecting an existing property when choosing a random property to access, see the next point.
+    ///   2. If we have no static type information about the object we're accessing.
+    ///     In that case there is a higher chance of success when using the small set of custom property names
+    ///     instead of the much larger set of all property names that exist in the environment (or something else).
+    public func randomCustomPropertyName() -> String {
+        return chooseUniform(from: fuzzer.environment.customProperties)
     }
 
-    /// Generates a random method name for the current program context.
-    public func genMethodName() -> String {
-        return chooseUniform(from: fuzzer.environment.methodNames)
+    /// Returns either a builtin or a custom property name, with equal probability.
+    public func randomPropertyName() -> String {
+        return probability(0.5) ? randomBuiltinPropertyName() : randomCustomPropertyName()
     }
+
+    /// Returns a random builtin method name.
+    ///
+    /// This will return a random name from the environment's list of builtin method names,
+    /// i.e. a method that exists on (at least) one builtin object type.
+    public func randomBuiltinMethodName() -> String {
+        return chooseUniform(from: fuzzer.environment.builtinMethods)
+    }
+
+    /// Returns a random custom method name.
+    ///
+    /// This will select a random method from a (usually relatively small) set of custom method names defined by the environment.
+    ///
+    /// See the comment for randomCustomPropertyName() for when this should be used.
+    public func randomCustomMethodName() -> String {
+        return chooseUniform(from: fuzzer.environment.customMethods)
+    }
+
+    /// Returns either a builtin or a custom method name, with equal probability.
+    public func randomMethodName() -> String {
+        return probability(0.5) ? randomBuiltinMethodName() : randomCustomMethodName()
+    }
+
 
     ///
     /// Access to variables.
     ///
 
     /// Returns a random variable.
-    public func randVar(excludeInnermostScope: Bool = false) -> Variable {
+    public func randomVariable() -> Variable {
         assert(hasVisibleVariables)
-        return randVarInternal(excludeInnermostScope: excludeInnermostScope)!
+        return randomVariableInternal()!
     }
 
     /// Returns up to N (different) random variables.
     /// This method will only return fewer than N variables if the number of currently visible variables is less than N.
-    public func randVars(upTo n: Int) -> [Variable] {
+    public func randomVariables(upTo n: Int) -> [Variable] {
         assert(hasVisibleVariables)
         var variables = [Variable]()
         while variables.count < n {
-            guard let newVar = randVarInternal(filter: { !variables.contains($0) }) else {
+            guard let newVar = randomVariableInternal(filter: { !variables.contains($0) }) else {
                 break
             }
             variables.append(newVar)
@@ -287,9 +351,7 @@ public class ProgramBuilder {
     ///
     /// In conservative mode, this function fails unless it finds a matching variable.
     /// In aggressive mode, this function will also return variables that have unknown type, and may, if no matching variables are available, return variables of any type.
-    ///
-    /// In certain cases, for example in the InputMutator, it might be required to exclude variables from the innermost scopes, which can be achieved by passing excludeInnermostScope: true.
-    public func randVar(ofType type: JSType, excludeInnermostScope: Bool = false) -> Variable? {
+    public func randomVariable(ofType type: JSType) -> Variable? {
         var wantedType = type
 
         // As query/input type, .unknown is treated as .anything.
@@ -303,31 +365,31 @@ public class ProgramBuilder {
             wantedType |= .unknown
         }
 
-        if let v = randVarInternal(filter: { self.type(of: $0).Is(wantedType) }, excludeInnermostScope: excludeInnermostScope) {
+        if let v = randomVariableInternal(filter: { self.type(of: $0).Is(wantedType) }) {
             return v
         }
 
         // Didn't find a matching variable. If we are in aggressive mode, we now simply return a random variable.
         if mode == .aggressive {
-            return randVar()
+            return randomVariable()
         }
 
         // Otherwise, we give up
         return nil
     }
 
-    /// Returns a random variable of the given type. This is the same as calling randVar in conservative building mode.
-    public func randVar(ofConservativeType type: JSType) -> Variable? {
+    /// Returns a random variable of the given type. This is the same as calling randomVariable in conservative building mode.
+    public func randomVariable(ofConservativeType type: JSType) -> Variable? {
         let oldMode = mode
         mode = .conservative
         defer { mode = oldMode }
-        return randVar(ofType: type)
+        return randomVariable(ofType: type)
     }
 
     /// Returns a random variable satisfying the given constraints or nil if none is found.
-    func randVarInternal(filter: ((Variable) -> Bool)? = nil, excludeInnermostScope: Bool = false) -> Variable? {
+    func randomVariableInternal(filter: ((Variable) -> Bool)? = nil) -> Variable? {
         var candidates = [Variable]()
-        let scopes = excludeInnermostScope ? scopeAnalyzer.scopes.dropLast() : scopeAnalyzer.scopes
+        let scopes = scopeAnalyzer.scopes
 
         // Prefer inner scopes
         withProbability(0.75) {
@@ -338,7 +400,7 @@ public class ProgramBuilder {
         }
 
         if candidates.isEmpty {
-            let visibleVariables = excludeInnermostScope ? scopes.reduce([], +) : scopeAnalyzer.visibleVariables
+            let visibleVariables = scopeAnalyzer.visibleVariables
             if let f = filter {
                 candidates = visibleVariables.filter(f)
             } else {
@@ -366,6 +428,11 @@ public class ProgramBuilder {
     /// Returns the type of the `super` binding at the current position.
     public func currentSuperType() -> JSType {
         return jsTyper.currentSuperType()
+    }
+
+    /// Returns the type of the super constructor.
+    public func currentSuperConstructorType() -> JSType {
+        return jsTyper.currentSuperConstructorType()
     }
 
     public func methodSignature(of methodName: String, on object: Variable) -> Signature {
@@ -425,13 +492,13 @@ public class ProgramBuilder {
         var arguments = [Variable]()
 
         for argumentType in argumentTypes {
-            if let v = randVar(ofConservativeType: argumentType) {
+            if let v = randomVariable(ofConservativeType: argumentType) {
                 arguments.append(v)
             } else {
                 let argument = generateVariable(ofType: argumentType)
                 // make sure, that now after generation we actually have a
                 // variable of that type available.
-                assert(randVar(ofType: argumentType) != nil)
+                assert(randomVariable(ofType: argumentType) != nil)
                 arguments.append(argument)
             }
         }
@@ -439,19 +506,19 @@ public class ProgramBuilder {
         return arguments
     }
 
-    public func randCallArguments(for signature: Signature) -> [Variable]? {
+    public func randomCallArguments(for signature: Signature) -> [Variable]? {
         let argumentTypes = prepareArgumentTypes(forSignature: signature)
         var arguments = [Variable]()
         for argumentType in argumentTypes {
-            guard let v = randVar(ofType: argumentType) else { return nil }
+            guard let v = randomVariable(ofType: argumentType) else { return nil }
             arguments.append(v)
         }
         return arguments
     }
 
-    public func randCallArguments(for function: Variable) -> [Variable]? {
+    public func randomCallArguments(for function: Variable) -> [Variable]? {
         let signature = type(of: function).signature ?? Signature.forUnknownFunction
-        return randCallArguments(for: signature)
+        return randomCallArguments(for: signature)
     }
 
     public func generateCallArguments(for function: Variable) -> [Variable] {
@@ -459,21 +526,21 @@ public class ProgramBuilder {
         return generateCallArguments(for: signature)
     }
 
-    public func randCallArguments(forMethod methodName: String, on object: Variable) -> [Variable]? {
+    public func randomCallArguments(forMethod methodName: String, on object: Variable) -> [Variable]? {
         let signature = methodSignature(of: methodName, on: object)
-        return randCallArguments(for: signature)
+        return randomCallArguments(for: signature)
     }
 
-    public func randCallArguments(forMethod methodName: String, on objType: JSType) -> [Variable]? {
+    public func randomCallArguments(forMethod methodName: String, on objType: JSType) -> [Variable]? {
         let signature = methodSignature(of: methodName, on: objType)
-        return randCallArguments(for: signature)
+        return randomCallArguments(for: signature)
     }
 
-    public func randCallArgumentsWithSpreading(n: Int) -> (arguments: [Variable], spreads: [Bool]) {
+    public func randomCallArgumentsWithSpreading(n: Int) -> (arguments: [Variable], spreads: [Bool]) {
         var arguments: [Variable] = []
         var spreads: [Bool] = []
         for _ in 0...n {
-            let val = randVar()
+            let val = randomVariable()
             arguments.append(val)
             // Prefer to spread values that we know are iterable, as non-iterable values will lead to exceptions ("TypeError: Found non-callable @@iterator")
             if type(of: val).Is(.iterable) {
@@ -505,29 +572,28 @@ public class ProgramBuilder {
 
         // Check primitive types
         if type.Is(.integer) || type.Is(fuzzer.environment.intType) {
-            return loadInt(genInt())
+            return loadInt(randomInt())
         }
         if type.Is(.float) || type.Is(fuzzer.environment.floatType) {
-            return loadFloat(genFloat())
+            return loadFloat(randomFloat())
         }
         if type.Is(.string) || type.Is(fuzzer.environment.stringType) {
-            return loadString(genString())
+            return loadString(randomString())
+        }
+        if type.Is(.regexp) || type.Is(fuzzer.environment.regExpType) {
+            return loadRegExp(randomRegExpPattern(), RegExpFlags.random())
         }
         if type.Is(.boolean) || type.Is(fuzzer.environment.booleanType) {
             return loadBool(Bool.random())
         }
         if type.Is(.bigint) || type.Is(fuzzer.environment.bigIntType) {
-            return loadBigInt(genInt())
+            return loadBigInt(randomInt())
         }
         if type.Is(.function()) {
             let signature = type.signature ?? Signature(withParameterCount: Int.random(in: 2...5), hasRestParam: probability(0.1))
             return buildPlainFunction(with: .signature(signature), isStrict: probability(0.1)) { _ in
-                buildRecursive()
-                doReturn(randVar())
+                doReturn(randomVariable())
             }
-        }
-        if type.Is(.regexp) || type.Is(fuzzer.environment.regExpType) {
-            return loadRegExp(genRegExp(), genRegExpFlags())
         }
 
         assert(type.Is(.object()), "Unexpected type encountered \(type)")
@@ -537,7 +603,7 @@ public class ProgramBuilder {
 
         // Fast path for array creation.
         if type.Is(fuzzer.environment.arrayType) && probability(0.9) {
-            let value = randVar()
+            let value = randomVariable()
             return createArray(with: Array(repeating: value, count: Int.random(in: 1...5)))
         }
 
@@ -572,35 +638,35 @@ public class ProgramBuilder {
                         // https://github.com/googleprojectzero/fuzzilli/blob/main/Docs/HowFuzzilliWorks.md#when-to-instantiate
                         // TODO I don't think we need to use the ofConservativeType version. The regular ofType version should
                         // be fine since the ProgramTemplates/HybridEngine do the code generation in conservative mode anyway.
-                        value = randVar(ofConservativeType: type) ?? generateVariable(ofType: type)
+                        value = randomVariable(ofConservativeType: type) ?? generateVariable(ofType: type)
                     } else {
                         if !hasVisibleVariables {
-                            value = loadInt(genInt())
+                            value = loadInt(randomInt())
                         } else {
-                            value = randVar()
+                            value = randomVariable()
                         }
                     }
                     initialProperties[prop] = value
                 }
                 // TODO: This should take the method type/signature into account!
-                _ = type.methods.map { initialProperties[$0] = randVar(ofType: .function()) ?? generateVariable(ofType: .function()) }
+                _ = type.methods.map { initialProperties[$0] = randomVariable(ofType: .function()) ?? generateVariable(ofType: .function()) }
                 obj = createObject(with: initialProperties)
-            } else { // Do it with storeProperty
+            } else { // Do it with setProperty
                 obj = construct(loadBuiltin("Object"), withArgs: [])
                 for method in type.methods {
                     // TODO: This should take the method type/signature into account!
-                    let methodVar = randVar(ofType: .function()) ?? generateVariable(ofType: .function())
-                    storeProperty(methodVar, as: method, on: obj)
+                    let methodVar = randomVariable(ofType: .function()) ?? generateVariable(ofType: .function())
+                    setProperty(method, of: obj, to: methodVar)
                 }
                 for prop in type.properties {
                     var value: Variable?
                     let type = self.type(ofProperty: prop)
                     if type != .unknown {
-                        value = randVar(ofConservativeType: type) ?? generateVariable(ofType: type)
+                        value = randomVariable(ofConservativeType: type) ?? generateVariable(ofType: type)
                     } else {
-                        value = randVar()
+                        value = randomVariable()
                     }
-                    storeProperty(value!, as: prop, on: obj)
+                    setProperty(prop, of: obj, to: value!)
                 }
             }
         }
@@ -773,14 +839,17 @@ public class ProgramBuilder {
                 blocks[instr.index] = block
                 activeBlocks.append(block)
             } else if instr.isBlockGroupEnd {
-                assert(!instr.hasOutputs)
                 let current = activeBlocks.removeLast()
                 current.endIndex = instr.index
                 blocks[instr.index] = current
                 // Merge requirements into parent block (if any)
                 updateBlockDependencies(current.requiredContext, current.requiredInputs)
+                // If the block end instruction has any outputs, they need to be added to the surrounding block.
+                updateBlockProvidedVariables(instr.outputs)
             } else if instr.isBlock {
-                assert(instr.numOutputs == 0)           // TODO still needed?
+                // We currently assume that inner block instructions cannot have outputs.
+                // If they ever do, they'll need to be added to the surrounding block.
+                assert(instr.numOutputs == 0)
                 blocks[instr.index] = activeBlocks.last!
             }
 
@@ -809,10 +878,10 @@ public class ProgramBuilder {
                 // Find a compatible (i.e. one of the same type) variable in the host program.
                 // If that doesn't work, either because we don't know the type or because there is no matching variable, then take a random variable unless we're in conservative building mode.
                 var maybeReplacement: Variable? = nil
-                if type != .unknown, let compatibleVariable = randVar(ofConservativeType: type.generalize()) {
+                if type != .unknown, let compatibleVariable = randomVariable(ofConservativeType: type.generalize()) {
                     maybeReplacement = compatibleVariable
                 } else if mode != .conservative && hasVisibleVariables {
-                    maybeReplacement = randVar()
+                    maybeReplacement = randomVariable()
                 }
                 if let replacement = maybeReplacement {
                     remappedVariables[v] = replacement
@@ -876,7 +945,8 @@ public class ProgramBuilder {
         //
         // Simple optimization: avoid splicing data-flow "roots", i.e. simple instructions that don't have any inputs, as this will
         // most of the time result in fairly uninteresting splices that for example just copy a literal from another program.
-        let rootCandidates = candidates.filter({ !program.code[$0].isSimple || program.code[$0].numInputs > 0 })
+        // The exception to this are special instructions that exist outside of JavaScript context, for example instructions that add fields to classes.
+        let rootCandidates = candidates.filter({ !program.code[$0].isSimple || program.code[$0].numInputs > 0 || !program.code[$0].op.requiredContext.contains(.javascript) })
         guard !rootCandidates.isEmpty else { return false }
         let rootIndex = specifiedIndex ?? chooseUniform(from: rootCandidates)
         guard rootCandidates.contains(rootIndex) else { return false }
@@ -991,12 +1061,12 @@ public class ProgramBuilder {
 
     /// Possible building modes. These are used as argument for build() and determine how the new code is produced.
     public enum BuildingMode {
-        // Run random code generators.
-        case runningGenerators
+        // Generate code by running CodeGenerators.
+        case generating
         // Splice code from other random programs in the corpus.
         case splicing
         // Do all of the above.
-        case runningGeneratorsAndSplicing
+        case generatingAndSplicing
     }
 
     private var openFunctions = [Variable]()
@@ -1019,14 +1089,14 @@ public class ProgramBuilder {
             self.mode = mode
         }
     }
-    private var buildStack = [BuildingState]()
+    private var buildStack = Stack<BuildingState>()
 
     /// Build random code at the current position in the program.
     ///
     /// The first parameter controls the number of emitted instructions: as soon as more than that number of instructions have been emitted, building stops.
     /// This parameter is only a rough estimate as recursive code generators may lead to significantly more code being generated.
     /// Typically, the actual number of generated instructions will be somewhere between n and 2x n.
-    public func build(n: Int = 1, by mode: BuildingMode = .runningGeneratorsAndSplicing) {
+    public func build(n: Int = 1, by mode: BuildingMode = .generatingAndSplicing) {
         assert(buildStack.isEmpty)
         buildInternal(initialBuildingBudget: n, mode: mode)
         assert(buildStack.isEmpty)
@@ -1035,7 +1105,7 @@ public class ProgramBuilder {
     /// Recursive code building. Used by CodeGenerators for example to fill the bodies of generated blocks.
     public func buildRecursive(block: Int = 1, of numBlocks: Int = 1, n optionalBudget: Int? = nil) {
         assert(!buildStack.isEmpty)
-        let parentState = buildStack.last!
+        let parentState = buildStack.top
 
         assert(parentState.mode != .splicing)
         assert(parentState.recursiveBuildingAllowed)        // If this fails, a recursive CodeGenerator is probably not marked as recursive.
@@ -1075,8 +1145,9 @@ public class ProgramBuilder {
         var consecutiveFailures = 0
 
         let state = BuildingState(initialBudget: initialBuildingBudget, mode: mode)
-        buildStack.append(state)
-        defer { buildStack.removeLast() }
+        buildStack.push(state)
+        defer { buildStack.pop() }
+        var remainingBudget = initialBuildingBudget
 
         // Unless we are only splicing, find all generators that have the required context. We must always have at least one suitable code generator.
         let origContext = context
@@ -1086,35 +1157,43 @@ public class ProgramBuilder {
             assert(!availableGenerators.isEmpty)
         }
 
-        var remainingBudget = initialBuildingBudget
+        // Code generators assume that there are visible variables that they can use. Futhermore, splicing also benefits
+        // from having existing variables to which variables in the slice can be rewired to.
+        // So if there are no visible variables, try to generate some first.
+        if !hasVisibleVariables {
+            guard context.contains(.javascript) else {
+                // This can sometimes happen, for example when trying to generate code in an empty object literal at the start of a program.
+                // There's not much we can do here, so just give up.
+                return
+            }
+            let valuesToGenerate = Int.random(in: 1...3)
+            for _ in 0..<valuesToGenerate {
+                remainingBudget -= run(chooseUniform(from: fuzzer.trivialCodeGenerators))
+            }
+            assert(hasVisibleVariables)
+        }
+
         while remainingBudget > 0 {
             assert(context == origContext, "Code generation or splicing must not change the current context")
 
             if state.recursiveBuildingAllowed &&
                 remainingBudget < ProgramBuilder.minBudgetForRecursiveCodeGeneration &&
                 availableGenerators.contains(where: { !$0.isRecursive }) {
-                // No more recursion at this point as we don't have enough budget left.
+                // No more recursion at this point since the remaining budget is too small.
                 state.recursiveBuildingAllowed = false
                 availableGenerators = availableGenerators.filter({ !$0.isRecursive })
                 assert(state.mode == .splicing || !availableGenerators.isEmpty)
             }
 
             var mode = state.mode
-            if mode == .runningGeneratorsAndSplicing {
-                mode = chooseUniform(from: [.runningGenerators, .splicing])
+            if mode == .generatingAndSplicing {
+                mode = chooseUniform(from: [.generating, .splicing])
             }
 
             let codeSizeBefore = code.count
             switch mode {
-            case .runningGenerators:
-                if !hasVisibleVariables {
-                    // Can't run code generators if there are no visible variables, so generate some.
-                    let valuesToGenerate = Int.random(in: 1...3)
-                    for _ in 0..<valuesToGenerate {
-                        run(chooseUniform(from: fuzzer.trivialCodeGenerators))
-                    }
-                    assert(hasVisibleVariables)
-                }
+            case .generating:
+                assert(hasVisibleVariables)
 
                 // Reset the code generator specific part of the state.
                 state.nextRecursiveBlockOfCurrentGenerator = 1
@@ -1148,17 +1227,18 @@ public class ProgramBuilder {
         }
     }
 
-    /// Runs a code generator in the current context.
-    public func run(_ generator: CodeGenerator) {
+    /// Runs a code generator in the current context and returns the number of generated instructions.
+    @discardableResult
+    public func run(_ generator: CodeGenerator) -> Int {
         assert(generator.requiredContext.isSubset(of: context))
 
         var inputs: [Variable] = []
         for type in generator.inputTypes {
             // TODO should this generate variables in conservative mode?
-            guard let val = randVar(ofType: type) else { return }
+            guard let val = randomVariable(ofType: type) else { return 0 }
             // In conservative mode, attempt to prevent direct recursion to reduce the number of timeouts
             // This is a very crude mechanism. It might be worth implementing a more sophisticated one.
-            if mode == .conservative && type.Is(.function()) && callLikelyRecurses(function: val) { return }
+            if mode == .conservative && type.Is(.function()) && callLikelyRecurses(function: val) { return 0 }
 
             inputs.append(val)
         }
@@ -1171,6 +1251,7 @@ public class ProgramBuilder {
             contributors.add(generator)
             generator.addedInstructions(numGeneratedInstructions)
         }
+        return numGeneratedInstructions
     }
 
     //
@@ -1201,12 +1282,6 @@ public class ProgramBuilder {
         return loadInt(value)
     }
 
-    public func reuseOrLoadAnyInt() -> Variable {
-        // This isn't guaranteed to succeed, but that's probably fine.
-        let val = seenIntegers.randomElement() ?? genInt()
-        return reuseOrLoadInt(val)
-    }
-
     public func reuseOrLoadFloat(_ value: Double) -> Variable {
         for v in scopeAnalyzer.visibleVariables {
             if let val = loadedFloats[v], val == value {
@@ -1214,11 +1289,6 @@ public class ProgramBuilder {
             }
         }
         return loadFloat(value)
-    }
-
-    public func reuseOrLoadAnyFloat() -> Variable {
-        let val = seenFloats.randomElement() ?? genFloat()
-        return reuseOrLoadFloat(val)
     }
 
 
@@ -1289,19 +1359,319 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func loadRegExp(_ value: String, _ flags: RegExpFlags) -> Variable {
-        return emit(LoadRegExp(value: value, flags: flags)).output
+    public func loadRegExp(_ pattern: String, _ flags: RegExpFlags) -> Variable {
+        return emit(LoadRegExp(pattern: pattern, flags: flags)).output
+    }
+
+    /// Represents a currently active object literal. Used to add fields to it and to query which fields already exist.
+    public class ObjectLiteral {
+        private let b: ProgramBuilder
+
+        fileprivate var existingProperties: [String] = []
+        fileprivate var existingElements: [Int64] = []
+        fileprivate var existingComputedProperties: [Variable] = []
+        fileprivate var existingMethods: [String] = []
+        fileprivate var existingGetters: [String] = []
+        fileprivate var existingSetters: [String] = []
+
+        public fileprivate(set) var hasPrototype = false
+
+        fileprivate init(in b: ProgramBuilder) {
+            assert(b.context.contains(.objectLiteral))
+            self.b = b
+        }
+
+        public func hasProperty(_ name: String) -> Bool {
+            return existingProperties.contains(name)
+        }
+
+        public func hasElement(_ index: Int64) -> Bool {
+            return existingElements.contains(index)
+        }
+
+        public func hasComputedProperty(_ name: Variable) -> Bool {
+            return existingComputedProperties.contains(name)
+        }
+
+        public func hasMethod(_ name: String) -> Bool {
+            return existingMethods.contains(name)
+        }
+
+        public func hasGetter(for name: String) -> Bool {
+            return existingGetters.contains(name)
+        }
+
+        public func hasSetter(for name: String) -> Bool {
+            return existingSetters.contains(name)
+        }
+
+        public func addProperty(_ name: String, as value: Variable) {
+            b.emit(ObjectLiteralAddProperty(propertyName: name), withInputs: [value])
+        }
+
+        public func addElement(_ index: Int64, as value: Variable) {
+            b.emit(ObjectLiteralAddElement(index: index), withInputs: [value])
+        }
+
+        public func addComputedProperty(_ name: Variable, as value: Variable) {
+            b.emit(ObjectLiteralAddComputedProperty(), withInputs: [name, value])
+        }
+
+        public func copyProperties(from obj: Variable) {
+            b.emit(ObjectLiteralCopyProperties(), withInputs: [obj])
+        }
+
+        public func setPrototype(to proto: Variable) {
+            b.emit(ObjectLiteralSetPrototype(), withInputs: [proto])
+        }
+
+        public func addMethod(_ name: String, with descriptor: SubroutineDescriptor, _ body: ([Variable]) -> ()) {
+            b.setSignatureForNextFunction(descriptor.signature)
+            let instr = b.emit(BeginObjectLiteralMethod(methodName: name, parameters: descriptor.parameters))
+            body(Array(instr.innerOutputs))
+            b.emit(EndObjectLiteralMethod())
+        }
+
+        public func addGetter(for name: String, _ body: (_ this: Variable) -> ()) {
+            let instr = b.emit(BeginObjectLiteralGetter(propertyName: name))
+            body(instr.innerOutput)
+            b.emit(EndObjectLiteralGetter())
+        }
+
+        public func addSetter(for name: String, _ body: (_ this: Variable, _ val: Variable) -> ()) {
+            let instr = b.emit(BeginObjectLiteralSetter(propertyName: name))
+            body(instr.innerOutput(0), instr.innerOutput(1))
+            b.emit(EndObjectLiteralSetter())
+        }
     }
 
     @discardableResult
+    public func buildObjectLiteral(_ body: (ObjectLiteral) -> ()) -> Variable {
+        emit(BeginObjectLiteral())
+        body(currentObjectLiteral)
+        return emit(EndObjectLiteral()).output
+    }
+
+    @discardableResult
+    // Convenience method to create simple object literals.
     public func createObject(with initialProperties: [String: Variable]) -> Variable {
-        // CreateObject expects sorted property names
-        var propertyNames = [String](), propertyValues = [Variable]()
-        for (k, v) in initialProperties.sorted(by: { $0.key < $1.key }) {
-            propertyNames.append(k)
-            propertyValues.append(v)
+        return buildObjectLiteral { obj in
+            // Sort the property names so that the emitted code is deterministic.
+            for (propertyName, value) in initialProperties.sorted(by: { $0.key < $1.key }) {
+                obj.addProperty(propertyName, as: value)
+            }
         }
-        return emit(CreateObject(propertyNames: propertyNames), withInputs: propertyValues).output
+    }
+
+    /// Represents a currently active class definition. Used to add fields to it and to query which fields already exist.
+    public class ClassDefinition {
+        private let b: ProgramBuilder
+
+        public let isDerivedClass: Bool
+
+        public fileprivate(set) var hasConstructor = false
+        fileprivate var existingInstanceProperties: [String] = []
+        fileprivate var existingInstanceElements: [Int64] = []
+        fileprivate var existingInstanceComputedProperties: [Variable] = []
+        fileprivate var existingInstanceMethods: [String] = []
+        fileprivate var existingInstanceGetters: [String] = []
+        fileprivate var existingInstanceSetters: [String] = []
+
+        fileprivate var existingStaticProperties: [String] = []
+        fileprivate var existingStaticElements: [Int64] = []
+        fileprivate var existingStaticComputedProperties: [Variable] = []
+        fileprivate var existingStaticMethods: [String] = []
+        fileprivate var existingStaticGetters: [String] = []
+        fileprivate var existingStaticSetters: [String] = []
+
+        // These sets are (read-only) exposed as they are required to ensure syntactic correctness:
+        // In JavaScript, it is a syntax error to access a private property/method that has not
+        // been declared by the surrounding class. Further, each private field must only be declared
+        // once, regardless of whether it is a method or a property and whether it's per-instance of
+        // static. However, we still track properties and methods separately to facilitate selecting
+        // property and method names for private property accesses and private method calls.
+        public fileprivate(set) var existingPrivateProperties: [String] = []
+        public fileprivate(set) var existingPrivateMethods: [String] = []
+
+        fileprivate init(in b: ProgramBuilder, isDerived: Bool) {
+            assert(b.context.contains(.classDefinition))
+            self.b = b
+            self.isDerivedClass = isDerived
+        }
+
+        public func hasInstanceProperty(_ name: String) -> Bool {
+            return existingInstanceProperties.contains(name)
+        }
+
+        public func hasInstanceElement(_ index: Int64) -> Bool {
+            return existingInstanceElements.contains(index)
+        }
+
+        public func hasInstanceComputedProperty(_ v: Variable) -> Bool {
+            return existingInstanceComputedProperties.contains(v)
+        }
+
+        public func hasInstanceMethod(_ name: String) -> Bool {
+            return existingInstanceMethods.contains(name)
+        }
+
+        public func hasInstanceGetter(for name: String) -> Bool {
+            return existingInstanceGetters.contains(name)
+        }
+
+        public func hasInstanceSetter(for name: String) -> Bool {
+            return existingInstanceSetters.contains(name)
+        }
+
+        public func hasStaticProperty(_ name: String) -> Bool {
+            return existingStaticProperties.contains(name)
+        }
+
+        public func hasStaticElement(_ index: Int64) -> Bool {
+            return existingStaticElements.contains(index)
+        }
+
+        public func hasStaticComputedProperty(_ v: Variable) -> Bool {
+            return existingStaticComputedProperties.contains(v)
+        }
+
+        public func hasStaticMethod(_ name: String) -> Bool {
+            return existingStaticMethods.contains(name)
+        }
+
+        public func hasStaticGetter(for name: String) -> Bool {
+            return existingStaticGetters.contains(name)
+        }
+
+        public func hasStaticSetter(for name: String) -> Bool {
+            return existingStaticSetters.contains(name)
+        }
+
+        public func hasPrivateProperty(_ name: String) -> Bool {
+            return existingPrivateProperties.contains(name)
+        }
+
+        public func hasPrivateMethod(_ name: String) -> Bool {
+            return existingPrivateMethods.contains(name)
+        }
+
+        public func hasPrivateField(_ name: String) -> Bool {
+            return hasPrivateProperty(name) || hasPrivateMethod(name)
+        }
+
+        public func addConstructor(with descriptor: SubroutineDescriptor, _ body: ([Variable]) -> ()) {
+            b.setSignatureForNextFunction(descriptor.signature)
+            let instr = b.emit(BeginClassConstructor(parameters: descriptor.parameters))
+            body(Array(instr.innerOutputs))
+            b.emit(EndClassConstructor())
+        }
+
+        public func addInstanceProperty(_ name: String, value: Variable? = nil) {
+            let inputs = value != nil ? [value!] : []
+            b.emit(ClassAddInstanceProperty(propertyName: name, hasValue: value != nil), withInputs: inputs)
+        }
+
+        public func addInstanceElement(_ index: Int64, value: Variable? = nil) {
+            let inputs = value != nil ? [value!] : []
+            b.emit(ClassAddInstanceElement(index: index, hasValue: value != nil), withInputs: inputs)
+        }
+
+        public func addInstanceComputedProperty(_ name: Variable, value: Variable? = nil) {
+            let inputs = value != nil ? [name, value!] : [name]
+            b.emit(ClassAddInstanceComputedProperty(hasValue: value != nil), withInputs: inputs)
+        }
+
+        public func addInstanceMethod(_ name: String, with descriptor: SubroutineDescriptor, _ body: ([Variable]) -> ()) {
+            b.setSignatureForNextFunction(descriptor.signature)
+            let instr = b.emit(BeginClassInstanceMethod(methodName: name, parameters: descriptor.parameters))
+            body(Array(instr.innerOutputs))
+            b.emit(EndClassInstanceMethod())
+        }
+
+        public func addInstanceGetter(for name: String, _ body: (_ this: Variable) -> ()) {
+            let instr = b.emit(BeginClassInstanceGetter(propertyName: name))
+            body(instr.innerOutput)
+            b.emit(EndClassInstanceGetter())
+        }
+
+        public func addInstanceSetter(for name: String, _ body: (_ this: Variable, _ val: Variable) -> ()) {
+            let instr = b.emit(BeginClassInstanceSetter(propertyName: name))
+            body(instr.innerOutput(0), instr.innerOutput(1))
+            b.emit(EndClassInstanceSetter())
+        }
+
+        public func addStaticProperty(_ name: String, value: Variable? = nil) {
+            let inputs = value != nil ? [value!] : []
+            b.emit(ClassAddStaticProperty(propertyName: name, hasValue: value != nil), withInputs: inputs)
+        }
+
+        public func addStaticElement(_ index: Int64, value: Variable? = nil) {
+            let inputs = value != nil ? [value!] : []
+            b.emit(ClassAddStaticElement(index: index, hasValue: value != nil), withInputs: inputs)
+        }
+
+        public func addStaticComputedProperty(_ name: Variable, value: Variable? = nil) {
+            let inputs = value != nil ? [name, value!] : [name]
+            b.emit(ClassAddStaticComputedProperty(hasValue: value != nil), withInputs: inputs)
+        }
+
+        public func addStaticInitializer(_ body: (Variable) -> ()) {
+            let instr = b.emit(BeginClassStaticInitializer())
+            body(instr.innerOutput)
+            b.emit(EndClassStaticInitializer())
+        }
+
+        public func addStaticMethod(_ name: String, with descriptor: SubroutineDescriptor, _ body: ([Variable]) -> ()) {
+            b.setSignatureForNextFunction(descriptor.signature)
+            let instr = b.emit(BeginClassStaticMethod(methodName: name, parameters: descriptor.parameters))
+            body(Array(instr.innerOutputs))
+            b.emit(EndClassStaticMethod())
+        }
+
+        public func addStaticGetter(for name: String, _ body: (_ this: Variable) -> ()) {
+            let instr = b.emit(BeginClassStaticGetter(propertyName: name))
+            body(instr.innerOutput)
+            b.emit(EndClassStaticGetter())
+        }
+
+        public func addStaticSetter(for name: String, _ body: (_ this: Variable, _ val: Variable) -> ()) {
+            let instr = b.emit(BeginClassStaticSetter(propertyName: name))
+            body(instr.innerOutput(0), instr.innerOutput(1))
+            b.emit(EndClassStaticSetter())
+        }
+
+        public func addPrivateInstanceProperty(_ name: String, value: Variable? = nil) {
+            let inputs = value != nil ? [value!] : []
+            b.emit(ClassAddPrivateInstanceProperty(propertyName: name, hasValue: value != nil), withInputs: inputs)
+        }
+
+        public func addPrivateInstanceMethod(_ name: String, with descriptor: SubroutineDescriptor, _ body: ([Variable]) -> ()) {
+            b.setSignatureForNextFunction(descriptor.signature)
+            let instr = b.emit(BeginClassPrivateInstanceMethod(methodName: name, parameters: descriptor.parameters))
+            body(Array(instr.innerOutputs))
+            b.emit(EndClassPrivateInstanceMethod())
+        }
+
+        public func addPrivateStaticProperty(_ name: String, value: Variable? = nil) {
+            let inputs = value != nil ? [value!] : []
+            b.emit(ClassAddPrivateStaticProperty(propertyName: name, hasValue: value != nil), withInputs: inputs)
+        }
+
+        public func addPrivateStaticMethod(_ name: String, with descriptor: SubroutineDescriptor, _ body: ([Variable]) -> ()) {
+            b.setSignatureForNextFunction(descriptor.signature)
+            let instr = b.emit(BeginClassPrivateStaticMethod(methodName: name, parameters: descriptor.parameters))
+            body(Array(instr.innerOutputs))
+            b.emit(EndClassPrivateStaticMethod())
+        }
+    }
+
+    @discardableResult
+    public func buildClassDefinition(withSuperclass superclass: Variable? = nil, _ body: (ClassDefinition) -> ()) -> Variable {
+        let inputs = superclass != nil ? [superclass!] : []
+        let output = emit(BeginClassDefinition(hasSuperclass: superclass != nil), withInputs: inputs).output
+        body(currentClassDefinition)
+        emit(EndClassDefinition())
+        return output
     }
 
     @discardableResult
@@ -1310,14 +1680,13 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func createObject(with initialProperties: [String: Variable], andSpreading spreads: [Variable]) -> Variable {
-        // CreateObjectWithgSpread expects sorted property names
-        var propertyNames = [String](), propertyValues = [Variable]()
-        for (k, v) in initialProperties.sorted(by: { $0.key < $1.key }) {
-            propertyNames.append(k)
-            propertyValues.append(v)
-        }
-        return emit(CreateObjectWithSpread(propertyNames: propertyNames, numSpreads: spreads.count), withInputs: propertyValues + spreads).output
+    public func createIntArray(with initialValues: [Int64]) -> Variable {
+        return emit(CreateIntArray(values: initialValues)).output
+    }
+
+    @discardableResult
+    public func createFloatArray(with initialValues: [Double]) -> Variable {
+        return emit(CreateFloatArray(values: initialValues)).output
     }
 
     @discardableResult
@@ -1337,16 +1706,16 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func loadProperty(_ name: String, of object: Variable) -> Variable {
-        return emit(LoadProperty(propertyName: name), withInputs: [object]).output
+    public func getProperty(_ name: String, of object: Variable) -> Variable {
+        return emit(GetProperty(propertyName: name), withInputs: [object]).output
     }
 
-    public func storeProperty(_ value: Variable, as name: String, on object: Variable) {
-        emit(StoreProperty(propertyName: name), withInputs: [object, value])
+    public func setProperty(_ name: String, of object: Variable, to value: Variable) {
+        emit(SetProperty(propertyName: name), withInputs: [object, value])
     }
 
-    public func storeProperty(_ value: Variable, as name: String, with op: BinaryOperator, on object: Variable) {
-        emit(StorePropertyWithBinop(propertyName: name, operator: op), withInputs: [object, value])
+    public func updateProperty(_ name: String, of object: Variable, with value: Variable, using op: BinaryOperator) {
+        emit(UpdateProperty(propertyName: name, operator: op), withInputs: [object, value])
     }
 
     @discardableResult
@@ -1375,16 +1744,16 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func loadElement(_ index: Int64, of array: Variable) -> Variable {
-        return emit(LoadElement(index: index), withInputs: [array]).output
+    public func getElement(_ index: Int64, of array: Variable) -> Variable {
+        return emit(GetElement(index: index), withInputs: [array]).output
     }
 
-    public func storeElement(_ value: Variable, at index: Int64, of array: Variable) {
-        emit(StoreElement(index: index), withInputs: [array, value])
+    public func setElement(_ index: Int64, of array: Variable, to value: Variable) {
+        emit(SetElement(index: index), withInputs: [array, value])
     }
 
-    public func storeElement(_ value: Variable, at index: Int64, with op: BinaryOperator, of array: Variable) {
-        emit(StoreElementWithBinop(index: index, operator: op), withInputs: [array, value])
+    public func updateElement(_ index: Int64, of array: Variable, with value: Variable, using op: BinaryOperator) {
+        emit(UpdateElement(index: index, operator: op), withInputs: [array, value])
     }
 
     @discardableResult
@@ -1406,16 +1775,16 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func loadComputedProperty(_ name: Variable, of object: Variable) -> Variable {
-        return emit(LoadComputedProperty(), withInputs: [object, name]).output
+    public func getComputedProperty(_ name: Variable, of object: Variable) -> Variable {
+        return emit(GetComputedProperty(), withInputs: [object, name]).output
     }
 
-    public func storeComputedProperty(_ value: Variable, as name: Variable, on object: Variable) {
-        emit(StoreComputedProperty(), withInputs: [object, name, value])
+    public func setComputedProperty(_ name: Variable, of object: Variable, to value: Variable) {
+        emit(SetComputedProperty(), withInputs: [object, name, value])
     }
 
-    public func storeComputedProperty(_ value: Variable, as name: Variable, with op: BinaryOperator, on object: Variable) {
-        emit(StoreComputedPropertyWithBinop(operator: op), withInputs: [object, name, value])
+    public func updateComputedProperty(_ name: Variable, of object: Variable, with value: Variable, using op: BinaryOperator) {
+        emit(UpdateComputedProperty(operator: op), withInputs: [object, name, value])
     }
 
     @discardableResult
@@ -1552,13 +1921,21 @@ public class ProgramBuilder {
         return instr.output
     }
 
-    public func doReturn(_ value: Variable) {
-        emit(Return(), withInputs: [value])
+    public func doReturn(_ value: Variable? = nil) {
+        if let returnValue = value {
+            emit(Return(hasReturnValue: true), withInputs: [returnValue])
+        } else {
+            emit(Return(hasReturnValue: false))
+        }
     }
 
     @discardableResult
-    public func yield(_ value: Variable) -> Variable {
-        return emit(Yield(), withInputs: [value]).output
+    public func yield(_ value: Variable? = nil) -> Variable {
+        if let argument = value {
+            return emit(Yield(hasArgument: true), withInputs: [argument]).output
+        } else {
+            return emit(Yield(hasArgument: false)).output
+        }
     }
 
     public func yieldEach(_ value: Variable) {
@@ -1571,7 +1948,7 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func callFunction(_ function: Variable, withArgs arguments: [Variable]) -> Variable {
+    public func callFunction(_ function: Variable, withArgs arguments: [Variable] = []) -> Variable {
         return emit(CallFunction(numArguments: arguments.count), withInputs: [function] + arguments).output
     }
 
@@ -1582,7 +1959,7 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func construct(_ constructor: Variable, withArgs arguments: [Variable]) -> Variable {
+    public func construct(_ constructor: Variable, withArgs arguments: [Variable] = []) -> Variable {
         return emit(Construct(numArguments: arguments.count), withInputs: [constructor] + arguments).output
     }
 
@@ -1593,7 +1970,7 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func callMethod(_ name: String, on object: Variable, withArgs arguments: [Variable]) -> Variable {
+    public func callMethod(_ name: String, on object: Variable, withArgs arguments: [Variable] = []) -> Variable {
         return emit(CallMethod(methodName: name, numArguments: arguments.count), withInputs: [object] + arguments).output
     }
 
@@ -1604,7 +1981,7 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func callComputedMethod(_ name: Variable, on object: Variable, withArgs arguments: [Variable]) -> Variable {
+    public func callComputedMethod(_ name: Variable, on object: Variable, withArgs arguments: [Variable] = []) -> Variable {
         return emit(CallComputedMethod(numArguments: arguments.count), withInputs: [object, name] + arguments).output
     }
 
@@ -1624,8 +2001,13 @@ public class ProgramBuilder {
         return emit(BinaryOperation(op), withInputs: [lhs, rhs]).output
     }
 
+    @discardableResult
+    public func ternary(_ condition: Variable, _ lhs: Variable, _ rhs: Variable) -> Variable {
+        return emit(TernaryOperation(), withInputs: [condition, lhs, rhs]).output
+    }
+
     public func reassign(_ output: Variable, to input: Variable, with op: BinaryOperator) {
-        emit(ReassignWithBinop(op), withInputs: [output, input])
+        emit(Update(op), withInputs: [output, input])
     }
 
     @discardableResult
@@ -1638,13 +2020,13 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func destruct(_ input: Variable, selecting indices: [Int64], hasRestElement: Bool = false) -> [Variable] {
-        let outputs = emit(DestructArray(indices: indices, hasRestElement: hasRestElement), withInputs: [input]).outputs
+    public func destruct(_ input: Variable, selecting indices: [Int64], lastIsRest: Bool = false) -> [Variable] {
+        let outputs = emit(DestructArray(indices: indices, lastIsRest: lastIsRest), withInputs: [input]).outputs
         return Array(outputs)
     }
 
-    public func destruct(_ input: Variable, selecting indices: [Int64], into outputs: [Variable], hasRestElement: Bool = false) {
-        emit(DestructArrayAndReassign(indices: indices, hasRestElement: hasRestElement), withInputs: [input] + outputs)
+    public func destruct(_ input: Variable, selecting indices: [Int64], into outputs: [Variable], lastIsRest: Bool = false) {
+        emit(DestructArrayAndReassign(indices: indices, lastIsRest: lastIsRest), withInputs: [input] + outputs)
     }
 
     @discardableResult
@@ -1663,12 +2045,20 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func conditional(_ condition: Variable, _ lhs: Variable, _ rhs: Variable) -> Variable {
-        return emit(ConditionalOperation(), withInputs: [condition, lhs, rhs]).output
+    public func loadNamedVariable(_ name: String) -> Variable {
+        return emit(LoadNamedVariable(name)).output
     }
 
-    public func eval(_ string: String, with arguments: [Variable] = []) {
-        emit(Eval(string, numArguments: arguments.count), withInputs: arguments)
+    public func storeNamedVariable(_ name: String, _ value: Variable) {
+        emit(StoreNamedVariable(name), withInputs: [value])
+    }
+
+    public func defineNamedVariable(_ name: String, _ value: Variable) {
+        emit(DefineNamedVariable(name), withInputs: [value])
+    }
+
+    public func eval(_ string: String, with arguments: [Variable] = [], hasOutput: Bool = false) {
+        emit(Eval(string, numArguments: arguments.count, hasOutput: hasOutput), withInputs: arguments)
     }
 
     public func buildWith(_ scopeObject: Variable, body: () -> Void) {
@@ -1677,77 +2067,8 @@ public class ProgramBuilder {
         emit(EndWith())
     }
 
-    @discardableResult
-    public func loadFromScope(id: String) -> Variable {
-        return emit(LoadFromScope(id: id)).output
-    }
-
-    public func storeToScope(_ value: Variable, as id: String) {
-        emit(StoreToScope(id: id), withInputs: [value])
-    }
-
     public func nop(numOutputs: Int = 0) {
         emit(Nop(numOutputs: numOutputs), withInputs: [])
-    }
-
-    public struct ClassBuilder {
-        public typealias MethodBodyGenerator = ([Variable]) -> ()
-        public typealias ConstructorBodyGenerator = MethodBodyGenerator
-
-        fileprivate var constructor: (descriptor: SubroutineDescriptor, generator: ConstructorBodyGenerator)? = nil
-        fileprivate var methods: [(name: String, descriptor: SubroutineDescriptor, generator: ConstructorBodyGenerator)] = []
-        fileprivate var properties: [String] = []
-
-        // This struct is only created by defineClass below
-        fileprivate init() {}
-
-        public mutating func defineConstructor(with descriptor: SubroutineDescriptor, _ generator: @escaping ConstructorBodyGenerator) {
-            constructor = (descriptor, generator)
-        }
-
-        public mutating func defineProperty(_ name: String) {
-            properties.append(name)
-        }
-
-        public mutating func defineMethod(_ name: String, with descriptor: SubroutineDescriptor, _ generator: @escaping MethodBodyGenerator) {
-            methods.append((name, descriptor, generator))
-        }
-    }
-
-    public typealias ClassBodyGenerator = (inout ClassBuilder) -> ()
-
-    @discardableResult
-    public func buildClass(withSuperclass superclass: Variable? = nil,
-                            _ body: ClassBodyGenerator) -> Variable {
-        // First collect all information about the class and the generators for constructor and method bodies
-        var builder = ClassBuilder()
-        body(&builder)
-
-        // Now compute the instance type and define the class
-        let properties = builder.properties
-        let methods = builder.methods.map({ ($0.name, $0.descriptor.parameters )})
-        let constructorDescriptor = builder.constructor?.descriptor ?? .parameters(n: 0)
-        let hasSuperclass = superclass != nil
-        setSignatureForNextFunction(builder.constructor?.descriptor.signature)
-        let classDefinition = emit(BeginClass(hasSuperclass: hasSuperclass,
-                                              constructorParameters: constructorDescriptor.parameters,
-                                              instanceProperties: properties,
-                                              instanceMethods: methods),
-                                   withInputs: hasSuperclass ? [superclass!] : [])
-
-        // The code directly following the BeginClass is the body of the constructor
-        builder.constructor?.generator(Array(classDefinition.innerOutputs))
-
-        // Next are the bodies of the methods
-        for method in builder.methods {
-            setSignatureForNextFunction(method.descriptor.signature)
-            let methodDefinition = emit(BeginMethod(numParameters: method.descriptor.parameters.count), withInputs: [])
-            method.generator(Array(methodDefinition.innerOutputs))
-        }
-
-        emit(EndClass())
-
-        return classDefinition.output
     }
 
     public func callSuperConstructor(withArgs arguments: [Variable]) {
@@ -1760,16 +2081,34 @@ public class ProgramBuilder {
     }
 
     @discardableResult
-    public func loadSuperProperty(_ name: String) -> Variable {
-        return emit(LoadSuperProperty(propertyName: name)).output
+    public func getPrivateProperty(_ name: String, of object: Variable) -> Variable {
+        return emit(GetPrivateProperty(propertyName: name), withInputs: [object]).output
     }
 
-    public func storeSuperProperty(_ value: Variable, as name: String) {
-        emit(StoreSuperProperty(propertyName: name), withInputs: [value])
+    public func setPrivateProperty(_ name: String, of object: Variable, to value: Variable) {
+        emit(SetPrivateProperty(propertyName: name), withInputs: [object, value])
     }
 
-    public func storeSuperProperty(_ value: Variable, as name: String, with op: BinaryOperator) {
-        emit(StoreSuperPropertyWithBinop(propertyName: name, operator: op), withInputs: [value])
+    public func updatePrivateProperty(_ name: String, of object: Variable, with value: Variable, using op: BinaryOperator) {
+        emit(UpdatePrivateProperty(propertyName: name, operator: op), withInputs: [object, value])
+    }
+
+    @discardableResult
+    public func callPrivateMethod(_ name: String, on object: Variable, withArgs arguments: [Variable]) -> Variable {
+        return emit(CallPrivateMethod(methodName: name, numArguments: arguments.count), withInputs: [object] + arguments).output
+    }
+
+    @discardableResult
+    public func getSuperProperty(_ name: String) -> Variable {
+        return emit(GetSuperProperty(propertyName: name)).output
+    }
+
+    public func setSuperProperty(_ name: String, to value: Variable) {
+        emit(SetSuperProperty(propertyName: name), withInputs: [value])
+    }
+
+    public func updateSuperProperty(_ name: String, with value: Variable, using op: BinaryOperator) {
+        emit(UpdateSuperProperty(propertyName: name, operator: op), withInputs: [value])
     }
 
     public func buildIf(_ condition: Variable, ifBody: () -> Void) {
@@ -1933,20 +2272,7 @@ public class ProgramBuilder {
 
         // The returned instruction will also contain its index in the program. Use that so the analyzers have access to the index.
         let instr = code.append(instr)
-
-        // Update our analyses
-        scopeAnalyzer.analyze(instr)
-        contextAnalyzer.analyze(instr)
-        // TODO could this become an Analyzer?
-        updateValueAnalysis(instr)
-        if instr.op is BeginAnyFunction {
-            openFunctions.append(instr.output)
-        } else if instr.op is EndAnyFunction {
-            openFunctions.removeLast()
-        }
-
-        // Update type information
-        jsTyper.analyze(instr)
+        analyze(instr)
 
         return instr
     }
@@ -1959,37 +2285,30 @@ public class ProgramBuilder {
         jsTyper.setSignature(forInstructionAt: code.count, to: signature)
     }
 
-    /// Update value analysis. In particular the set of seen values and the variables that contain them for variable reuse.
-    private func updateValueAnalysis(_ instr: Instruction) {
-        switch instr.op {
-        case let op as LoadInteger:
-            seenIntegers.insert(op.value)
+    /// Analyze the given instruction. Should be called directly after appending the instruction to the code.
+    ///
+    /// This will do the following:
+    /// * Update the scope analysis to process any scope changes, which is required for correctly tracking the visible variables
+    /// * Update the context analysis to process any context changes
+    /// * Update the set of seen values and the variables that contain them for variable reuse
+    /// * Update object literal state when fields are added to an object literal
+    /// * Update the set of open function definitions, used to avoid trivial recursion
+    /// * Run type inference to determine output types and any other type changes
+    private func analyze(_ instr: Instruction) {
+        assert(code.lastInstruction.op === instr.op)
+
+        // Update scope and context analysis.
+        scopeAnalyzer.analyze(instr)
+        contextAnalyzer.analyze(instr)
+
+        // Update the lists of observed values.
+        switch instr.op.opcode {
+        case .loadInteger(let op):
             loadedIntegers[instr.output] = op.value
-        case let op as LoadBigInt:
-            seenIntegers.insert(op.value)
-        case let op as LoadFloat:
-            seenFloats.insert(op.value)
+        case .loadFloat(let op):
             loadedFloats[instr.output] = op.value
-        case let op as LoadBuiltin:
+        case .loadBuiltin(let op):
             loadedBuiltins[instr.output] = op.builtinName
-        case let op as LoadProperty:
-            seenPropertyNames.insert(op.propertyName)
-        case let op as StoreProperty:
-            seenPropertyNames.insert(op.propertyName)
-        case let op as StorePropertyWithBinop:
-            seenPropertyNames.insert(op.propertyName)
-        case let op as DeleteProperty:
-            seenPropertyNames.insert(op.propertyName)
-        case let op as LoadElement:
-            seenIntegers.insert(op.index)
-        case let op as StoreElement:
-            seenIntegers.insert(op.index)
-        case let op as StoreElementWithBinop:
-            seenIntegers.insert(op.index)
-        case let op as DeleteElement:
-            seenIntegers.insert(op.index)
-        case let op as CreateObject:
-            seenPropertyNames.formUnion(op.propertyNames)
         default:
             break
         }
@@ -2002,5 +2321,86 @@ public class ProgramBuilder {
                 loadedFloats.removeValue(forKey: v)
             }
         }
+
+        // Update object literal and class definition state.
+        switch instr.op.opcode {
+        case .beginObjectLiteral:
+            activeObjectLiterals.push(ObjectLiteral(in: self))
+        case .objectLiteralAddProperty(let op):
+            currentObjectLiteral.existingProperties.append(op.propertyName)
+        case .objectLiteralAddElement(let op):
+            currentObjectLiteral.existingElements.append(op.index)
+        case .objectLiteralAddComputedProperty:
+            currentObjectLiteral.existingComputedProperties.append(instr.input(0))
+        case .objectLiteralCopyProperties:
+            // Cannot generally determine what fields this installs.
+            break
+        case .objectLiteralSetPrototype:
+            currentObjectLiteral.hasPrototype = true
+        case .beginObjectLiteralMethod(let op):
+            currentObjectLiteral.existingMethods.append(op.methodName)
+        case .beginObjectLiteralGetter(let op):
+            currentObjectLiteral.existingGetters.append(op.propertyName)
+        case .beginObjectLiteralSetter(let op):
+            currentObjectLiteral.existingSetters.append(op.propertyName)
+        case .endObjectLiteralMethod,
+             .endObjectLiteralGetter,
+             .endObjectLiteralSetter:
+            break
+        case .endObjectLiteral:
+            activeObjectLiterals.pop()
+
+        case .beginClassDefinition(let op):
+            activeClassDefinitions.push(ClassDefinition(in: self, isDerived: op.hasSuperclass))
+        case .beginClassConstructor:
+            activeClassDefinitions.top.hasConstructor = true
+        case .classAddInstanceProperty(let op):
+            activeClassDefinitions.top.existingInstanceProperties.append(op.propertyName)
+        case .classAddInstanceElement(let op):
+            activeClassDefinitions.top.existingInstanceElements.append(op.index)
+        case .classAddInstanceComputedProperty:
+            activeClassDefinitions.top.existingInstanceComputedProperties.append(instr.input(0))
+        case .beginClassInstanceMethod(let op):
+            activeClassDefinitions.top.existingInstanceMethods.append(op.methodName)
+        case .beginClassInstanceGetter(let op):
+            activeClassDefinitions.top.existingInstanceGetters.append(op.propertyName)
+        case .beginClassInstanceSetter(let op):
+            activeClassDefinitions.top.existingInstanceSetters.append(op.propertyName)
+        case .classAddStaticProperty(let op):
+            activeClassDefinitions.top.existingStaticProperties.append(op.propertyName)
+        case .classAddStaticElement(let op):
+            activeClassDefinitions.top.existingStaticElements.append(op.index)
+        case .classAddStaticComputedProperty:
+            activeClassDefinitions.top.existingStaticComputedProperties.append(instr.input(0))
+        case .beginClassStaticMethod(let op):
+            activeClassDefinitions.top.existingStaticMethods.append(op.methodName)
+        case .beginClassStaticGetter(let op):
+            activeClassDefinitions.top.existingStaticGetters.append(op.propertyName)
+        case .beginClassStaticSetter(let op):
+            activeClassDefinitions.top.existingStaticSetters.append(op.propertyName)
+        case .classAddPrivateInstanceProperty(let op):
+            activeClassDefinitions.top.existingPrivateProperties.append(op.propertyName)
+        case .beginClassPrivateInstanceMethod(let op):
+            activeClassDefinitions.top.existingPrivateMethods.append(op.methodName)
+        case .classAddPrivateStaticProperty(let op):
+            activeClassDefinitions.top.existingPrivateProperties.append(op.propertyName)
+        case .beginClassPrivateStaticMethod(let op):
+            activeClassDefinitions.top.existingPrivateMethods.append(op.methodName)
+        case .endClassDefinition:
+            activeClassDefinitions.pop()
+        default:
+            assert(!instr.op.requiredContext.contains(.objectLiteral))
+            break
+        }
+
+        // Track open functions.
+        if instr.op is BeginAnyFunction {
+            openFunctions.append(instr.output)
+        } else if instr.op is EndAnyFunction {
+            openFunctions.removeLast()
+        }
+
+        // Update type information.
+        jsTyper.analyze(instr)
     }
 }

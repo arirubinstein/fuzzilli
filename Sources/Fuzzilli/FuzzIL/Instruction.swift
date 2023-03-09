@@ -87,9 +87,14 @@ public struct Instruction {
         return numOutputs + numInnerOutputs > 0
     }
 
+    /// Whether this instruction has exaclty one output.
+    public var hasOneOutput: Bool {
+        return numOutputs == 1
+    }
+
     /// Convenience getter for simple operations that produce a single output variable.
     public var output: Variable {
-        assert(numOutputs == 1)
+        assert(hasOneOutput)
         return inouts_[numInputs]
     }
 
@@ -99,7 +104,7 @@ public struct Instruction {
         return inouts_[numInputs + numOutputs]
     }
 
-    /// The output variables of this instruction.
+    /// The output variables of this instruction in the surrounding scope.
     public var outputs: ArraySlice<Variable> {
         return inouts_[numInputs ..< numInputs + numOutputs]
     }
@@ -296,61 +301,179 @@ extension Instruction: ProtobufConvertible {
         let result = ProtobufType.with {
             $0.inouts = inouts.map({ UInt32($0.number) })
 
-            if isOperationMutable {
-                // It's probably a somewhat complex operation, so see if we can use the cache instead.
-                if let idx = opCache?.get(op) {
-                    $0.opIdx = UInt32(idx)
-                    return
-                }
+            // First see if we can use the cache.
+            if let idx = opCache?.get(op) {
+                $0.opIdx = UInt32(idx)
+                return
             }
 
-            switch op {
-            case is Nop:
+            // Otherwise, encode the operation.
+            switch op.opcode {
+            case .nop:
                 $0.nop = Fuzzilli_Protobuf_Nop()
-            case let op as LoadInteger:
+            case .loadInteger(let op):
                 $0.loadInteger = Fuzzilli_Protobuf_LoadInteger.with { $0.value = op.value }
-            case let op as LoadBigInt:
+            case .loadBigInt(let op):
                 $0.loadBigInt = Fuzzilli_Protobuf_LoadBigInt.with { $0.value = op.value }
-            case let op as LoadFloat:
+            case .loadFloat(let op):
                 $0.loadFloat = Fuzzilli_Protobuf_LoadFloat.with { $0.value = op.value }
-            case let op as LoadString:
+            case .loadString(let op):
                 $0.loadString = Fuzzilli_Protobuf_LoadString.with { $0.value = op.value }
-            case let op as LoadBoolean:
+            case .loadBoolean(let op):
                 $0.loadBoolean = Fuzzilli_Protobuf_LoadBoolean.with { $0.value = op.value }
-            case is LoadUndefined:
+            case .loadUndefined:
                 $0.loadUndefined = Fuzzilli_Protobuf_LoadUndefined()
-            case is LoadNull:
+            case .loadNull:
                 $0.loadNull = Fuzzilli_Protobuf_LoadNull()
-            case is LoadThis:
+            case .loadThis:
                 $0.loadThis = Fuzzilli_Protobuf_LoadThis()
-            case is LoadArguments:
+            case .loadArguments:
                 $0.loadArguments = Fuzzilli_Protobuf_LoadArguments()
-            case let op as LoadRegExp:
-                $0.loadRegExp = Fuzzilli_Protobuf_LoadRegExp.with { $0.value = op.value; $0.flags = op.flags.rawValue }
-            case let op as CreateObject:
-                $0.createObject = Fuzzilli_Protobuf_CreateObject.with { $0.propertyNames = op.propertyNames }
-            case let op as CreateObjectWithSpread:
-                $0.createObjectWithSpread = Fuzzilli_Protobuf_CreateObjectWithSpread.with { $0.propertyNames = op.propertyNames }
-            case is CreateArray:
+            case .loadRegExp(let op):
+                $0.loadRegExp = Fuzzilli_Protobuf_LoadRegExp.with { $0.pattern = op.pattern; $0.flags = op.flags.rawValue }
+            case .beginObjectLiteral:
+                $0.beginObjectLiteral = Fuzzilli_Protobuf_BeginObjectLiteral()
+            case .objectLiteralAddProperty(let op):
+                $0.objectLiteralAddProperty = Fuzzilli_Protobuf_ObjectLiteralAddProperty.with { $0.propertyName = op.propertyName }
+            case .objectLiteralAddElement(let op):
+                $0.objectLiteralAddElement = Fuzzilli_Protobuf_ObjectLiteralAddElement.with { $0.index = op.index }
+            case .objectLiteralAddComputedProperty:
+                $0.objectLiteralAddComputedProperty = Fuzzilli_Protobuf_ObjectLiteralAddComputedProperty()
+            case .objectLiteralCopyProperties:
+                $0.objectLiteralCopyProperties = Fuzzilli_Protobuf_ObjectLiteralCopyProperties()
+            case .objectLiteralSetPrototype:
+                $0.objectLiteralSetPrototype = Fuzzilli_Protobuf_ObjectLiteralSetPrototype()
+            case .beginObjectLiteralMethod(let op):
+                $0.beginObjectLiteralMethod = Fuzzilli_Protobuf_BeginObjectLiteralMethod.with {
+                    $0.methodName = op.methodName
+                    $0.parameters = convertParameters(op.parameters)
+                }
+            case .endObjectLiteralMethod:
+                $0.endObjectLiteralMethod = Fuzzilli_Protobuf_EndObjectLiteralMethod()
+            case .beginObjectLiteralGetter(let op):
+                $0.beginObjectLiteralGetter = Fuzzilli_Protobuf_BeginObjectLiteralGetter.with { $0.propertyName = op.propertyName }
+            case .endObjectLiteralGetter:
+                $0.endObjectLiteralGetter = Fuzzilli_Protobuf_EndObjectLiteralGetter()
+            case .beginObjectLiteralSetter(let op):
+                $0.beginObjectLiteralSetter = Fuzzilli_Protobuf_BeginObjectLiteralSetter.with { $0.propertyName = op.propertyName }
+            case .endObjectLiteralSetter:
+                $0.endObjectLiteralSetter = Fuzzilli_Protobuf_EndObjectLiteralSetter()
+            case .endObjectLiteral:
+                $0.endObjectLiteral = Fuzzilli_Protobuf_EndObjectLiteral()
+            case .beginClassDefinition(let op):
+                $0.beginClassDefinition = Fuzzilli_Protobuf_BeginClassDefinition.with { $0.hasSuperclass_p = op.hasSuperclass }
+            case .beginClassConstructor(let op):
+                $0.beginClassConstructor = Fuzzilli_Protobuf_BeginClassConstructor.with { $0.parameters = convertParameters(op.parameters) }
+            case .endClassConstructor:
+                $0.endClassConstructor = Fuzzilli_Protobuf_EndClassConstructor()
+            case .classAddInstanceProperty(let op):
+                $0.classAddInstanceProperty = Fuzzilli_Protobuf_ClassAddInstanceProperty.with {
+                    $0.propertyName = op.propertyName
+                    $0.hasValue_p = op.hasValue
+                }
+            case .classAddInstanceElement(let op):
+                $0.classAddInstanceElement = Fuzzilli_Protobuf_ClassAddInstanceElement.with {
+                    $0.index = op.index
+                    $0.hasValue_p = op.hasValue
+                }
+            case .classAddInstanceComputedProperty(let op):
+                $0.classAddInstanceComputedProperty = Fuzzilli_Protobuf_ClassAddInstanceComputedProperty.with { $0.hasValue_p = op.hasValue }
+            case .beginClassInstanceMethod(let op):
+                $0.beginClassInstanceMethod = Fuzzilli_Protobuf_BeginClassInstanceMethod.with {
+                    $0.methodName = op.methodName
+                    $0.parameters = convertParameters(op.parameters)
+                }
+            case .endClassInstanceMethod:
+                $0.endClassInstanceMethod = Fuzzilli_Protobuf_EndClassInstanceMethod()
+            case .beginClassInstanceGetter(let op):
+                $0.beginClassInstanceGetter = Fuzzilli_Protobuf_BeginClassInstanceGetter.with { $0.propertyName = op.propertyName }
+            case .endClassInstanceGetter:
+                $0.endClassInstanceGetter = Fuzzilli_Protobuf_EndClassInstanceGetter()
+            case .beginClassInstanceSetter(let op):
+                $0.beginClassInstanceSetter = Fuzzilli_Protobuf_BeginClassInstanceSetter.with { $0.propertyName = op.propertyName }
+            case .endClassInstanceSetter:
+                $0.endClassInstanceSetter = Fuzzilli_Protobuf_EndClassInstanceSetter()
+            case .classAddStaticProperty(let op):
+                $0.classAddStaticProperty = Fuzzilli_Protobuf_ClassAddStaticProperty.with {
+                    $0.propertyName = op.propertyName
+                    $0.hasValue_p = op.hasValue
+                }
+            case .classAddStaticElement(let op):
+                $0.classAddStaticElement = Fuzzilli_Protobuf_ClassAddStaticElement.with {
+                    $0.index = op.index
+                    $0.hasValue_p = op.hasValue
+                }
+            case .classAddStaticComputedProperty(let op):
+                $0.classAddStaticComputedProperty = Fuzzilli_Protobuf_ClassAddStaticComputedProperty.with { $0.hasValue_p = op.hasValue }
+            case .beginClassStaticInitializer:
+                $0.beginClassStaticInitializer = Fuzzilli_Protobuf_BeginClassStaticInitializer()
+            case .endClassStaticInitializer:
+                $0.endClassStaticInitializer = Fuzzilli_Protobuf_EndClassStaticInitializer()
+            case .beginClassStaticMethod(let op):
+                $0.beginClassStaticMethod = Fuzzilli_Protobuf_BeginClassStaticMethod.with {
+                    $0.methodName = op.methodName
+                    $0.parameters = convertParameters(op.parameters)
+                }
+            case .endClassStaticMethod:
+                $0.endClassStaticMethod = Fuzzilli_Protobuf_EndClassStaticMethod()
+            case .beginClassStaticGetter(let op):
+                $0.beginClassStaticGetter = Fuzzilli_Protobuf_BeginClassStaticGetter.with { $0.propertyName = op.propertyName }
+            case .endClassStaticGetter:
+                $0.endClassStaticGetter = Fuzzilli_Protobuf_EndClassStaticGetter()
+            case .beginClassStaticSetter(let op):
+                $0.beginClassStaticSetter = Fuzzilli_Protobuf_BeginClassStaticSetter.with { $0.propertyName = op.propertyName }
+            case .endClassStaticSetter:
+                $0.endClassStaticSetter = Fuzzilli_Protobuf_EndClassStaticSetter()
+            case .classAddPrivateInstanceProperty(let op):
+                $0.classAddPrivateInstanceProperty = Fuzzilli_Protobuf_ClassAddPrivateInstanceProperty.with {
+                    $0.propertyName = op.propertyName
+                    $0.hasValue_p = op.hasValue
+                }
+            case .beginClassPrivateInstanceMethod(let op):
+                $0.beginClassPrivateInstanceMethod = Fuzzilli_Protobuf_BeginClassPrivateInstanceMethod.with {
+                    $0.methodName = op.methodName
+                    $0.parameters = convertParameters(op.parameters)
+                }
+            case .endClassPrivateInstanceMethod:
+                $0.endClassPrivateInstanceMethod = Fuzzilli_Protobuf_EndClassPrivateInstanceMethod()
+            case .classAddPrivateStaticProperty(let op):
+                $0.classAddPrivateStaticProperty = Fuzzilli_Protobuf_ClassAddPrivateStaticProperty.with {
+                    $0.propertyName = op.propertyName
+                    $0.hasValue_p = op.hasValue
+                }
+            case .beginClassPrivateStaticMethod(let op):
+                $0.beginClassPrivateStaticMethod = Fuzzilli_Protobuf_BeginClassPrivateStaticMethod.with {
+                    $0.methodName = op.methodName
+                    $0.parameters = convertParameters(op.parameters)
+                }
+            case .endClassPrivateStaticMethod:
+                $0.endClassPrivateStaticMethod = Fuzzilli_Protobuf_EndClassPrivateStaticMethod()
+            case .endClassDefinition:
+                $0.endClassDefinition = Fuzzilli_Protobuf_EndClassDefinition()
+            case .createArray:
                 $0.createArray = Fuzzilli_Protobuf_CreateArray()
-            case let op as CreateArrayWithSpread:
+            case .createIntArray(let op):
+                $0.createIntArray = Fuzzilli_Protobuf_CreateIntArray.with { $0.values = op.values }
+            case .createFloatArray(let op):
+                $0.createFloatArray = Fuzzilli_Protobuf_CreateFloatArray.with { $0.values = op.values }
+            case .createArrayWithSpread(let op):
                 $0.createArrayWithSpread = Fuzzilli_Protobuf_CreateArrayWithSpread.with { $0.spreads = op.spreads }
-            case let op as CreateTemplateString:
+            case .createTemplateString(let op):
                 $0.createTemplateString = Fuzzilli_Protobuf_CreateTemplateString.with { $0.parts = op.parts }
-            case let op as LoadBuiltin:
+            case .loadBuiltin(let op):
                 $0.loadBuiltin = Fuzzilli_Protobuf_LoadBuiltin.with { $0.builtinName = op.builtinName }
-            case let op as LoadProperty:
-                $0.loadProperty = Fuzzilli_Protobuf_LoadProperty.with { $0.propertyName = op.propertyName }
-            case let op as StoreProperty:
-                $0.storeProperty = Fuzzilli_Protobuf_StoreProperty.with { $0.propertyName = op.propertyName }
-            case let op as StorePropertyWithBinop:
-                $0.storePropertyWithBinop = Fuzzilli_Protobuf_StorePropertyWithBinop.with {
+            case .getProperty(let op):
+                $0.getProperty = Fuzzilli_Protobuf_GetProperty.with { $0.propertyName = op.propertyName }
+            case .setProperty(let op):
+                $0.setProperty = Fuzzilli_Protobuf_SetProperty.with { $0.propertyName = op.propertyName }
+            case .updateProperty(let op):
+                $0.updateProperty = Fuzzilli_Protobuf_UpdateProperty.with {
                     $0.propertyName = op.propertyName
                     $0.op = convertEnum(op.op, BinaryOperator.allCases)
                 }
-            case let op as DeleteProperty:
+            case .deleteProperty(let op):
                 $0.deleteProperty = Fuzzilli_Protobuf_DeleteProperty.with { $0.propertyName = op.propertyName }
-            case let op as ConfigureProperty:
+            case .configureProperty(let op):
                 $0.configureProperty = Fuzzilli_Protobuf_ConfigureProperty.with {
                     $0.propertyName = op.propertyName
                     $0.isWritable = op.flags.contains(.writable)
@@ -358,18 +481,18 @@ extension Instruction: ProtobufConvertible {
                     $0.isEnumerable = op.flags.contains(.enumerable)
                     $0.type = convertEnum(op.type, PropertyType.allCases)
                 }
-            case let op as LoadElement:
-                $0.loadElement = Fuzzilli_Protobuf_LoadElement.with { $0.index = op.index }
-            case let op as StoreElement:
-                $0.storeElement = Fuzzilli_Protobuf_StoreElement.with { $0.index = op.index }
-            case let op as StoreElementWithBinop:
-                $0.storeElementWithBinop = Fuzzilli_Protobuf_StoreElementWithBinop.with {
+            case .getElement(let op):
+                $0.getElement = Fuzzilli_Protobuf_GetElement.with { $0.index = op.index }
+            case .setElement(let op):
+                $0.setElement = Fuzzilli_Protobuf_SetElement.with { $0.index = op.index }
+            case .updateElement(let op):
+                $0.updateElement = Fuzzilli_Protobuf_UpdateElement.with {
                     $0.index = op.index
                     $0.op = convertEnum(op.op, BinaryOperator.allCases)
                 }
-            case let op as DeleteElement:
+            case .deleteElement(let op):
                 $0.deleteElement = Fuzzilli_Protobuf_DeleteElement.with { $0.index = op.index }
-            case let op as ConfigureElement:
+            case .configureElement(let op):
                 $0.configureElement = Fuzzilli_Protobuf_ConfigureElement.with {
                     $0.index = op.index
                     $0.isWritable = op.flags.contains(.writable)
@@ -377,253 +500,257 @@ extension Instruction: ProtobufConvertible {
                     $0.isEnumerable = op.flags.contains(.enumerable)
                     $0.type = convertEnum(op.type, PropertyType.allCases)
                 }
-            case is LoadComputedProperty:
-                $0.loadComputedProperty = Fuzzilli_Protobuf_LoadComputedProperty()
-            case is StoreComputedProperty:
-                $0.storeComputedProperty = Fuzzilli_Protobuf_StoreComputedProperty()
-            case let op as StoreComputedPropertyWithBinop:
-                $0.storeComputedPropertyWithBinop = Fuzzilli_Protobuf_StoreComputedPropertyWithBinop.with{ $0.op = convertEnum(op.op, BinaryOperator.allCases) }
-            case is DeleteComputedProperty:
+            case .getComputedProperty:
+                $0.getComputedProperty = Fuzzilli_Protobuf_GetComputedProperty()
+            case .setComputedProperty:
+                $0.setComputedProperty = Fuzzilli_Protobuf_SetComputedProperty()
+            case .updateComputedProperty(let op):
+                $0.updateComputedProperty = Fuzzilli_Protobuf_UpdateComputedProperty.with{ $0.op = convertEnum(op.op, BinaryOperator.allCases) }
+            case .deleteComputedProperty:
                 $0.deleteComputedProperty = Fuzzilli_Protobuf_DeleteComputedProperty()
-            case let op as ConfigureComputedProperty:
+            case .configureComputedProperty(let op):
                 $0.configureComputedProperty = Fuzzilli_Protobuf_ConfigureComputedProperty.with {
                     $0.isWritable = op.flags.contains(.writable)
                     $0.isConfigurable = op.flags.contains(.configurable)
                     $0.isEnumerable = op.flags.contains(.enumerable)
                     $0.type = convertEnum(op.type, PropertyType.allCases)
                 }
-            case is TypeOf:
+            case .typeOf:
                 $0.typeOf = Fuzzilli_Protobuf_TypeOf()
-            case is TestInstanceOf:
+            case .testInstanceOf:
                 $0.testInstanceOf = Fuzzilli_Protobuf_TestInstanceOf()
-            case is TestIn:
+            case .testIn:
                 $0.testIn = Fuzzilli_Protobuf_TestIn()
-            case let op as BeginPlainFunction:
+            case .beginPlainFunction(let op):
                 $0.beginPlainFunction = Fuzzilli_Protobuf_BeginPlainFunction.with {
                     $0.parameters = convertParameters(op.parameters)
                     $0.isStrict = op.isStrict
                 }
-            case is EndPlainFunction:
+            case .endPlainFunction:
                 $0.endPlainFunction = Fuzzilli_Protobuf_EndPlainFunction()
-            case let op as BeginArrowFunction:
+            case .beginArrowFunction(let op):
                 $0.beginArrowFunction = Fuzzilli_Protobuf_BeginArrowFunction.with {
                     $0.parameters = convertParameters(op.parameters)
                     $0.isStrict = op.isStrict
                 }
-            case is EndArrowFunction:
+            case .endArrowFunction:
                 $0.endArrowFunction = Fuzzilli_Protobuf_EndArrowFunction()
-            case let op as BeginGeneratorFunction:
+            case .beginGeneratorFunction(let op):
                 $0.beginGeneratorFunction = Fuzzilli_Protobuf_BeginGeneratorFunction.with {
                     $0.parameters = convertParameters(op.parameters)
                     $0.isStrict = op.isStrict
                 }
-            case is EndGeneratorFunction:
+            case .endGeneratorFunction:
                 $0.endGeneratorFunction = Fuzzilli_Protobuf_EndGeneratorFunction()
-            case let op as BeginAsyncFunction:
+            case .beginAsyncFunction(let op):
                 $0.beginAsyncFunction = Fuzzilli_Protobuf_BeginAsyncFunction.with {
                     $0.parameters = convertParameters(op.parameters)
                     $0.isStrict = op.isStrict
                 }
-            case is EndAsyncFunction:
+            case.endAsyncFunction:
                 $0.endAsyncFunction = Fuzzilli_Protobuf_EndAsyncFunction()
-            case let op as BeginAsyncArrowFunction:
+            case .beginAsyncArrowFunction(let op):
                 $0.beginAsyncArrowFunction = Fuzzilli_Protobuf_BeginAsyncArrowFunction.with {
                     $0.parameters = convertParameters(op.parameters)
                     $0.isStrict = op.isStrict
                 }
-            case is EndAsyncArrowFunction:
+            case .endAsyncArrowFunction:
                 $0.endAsyncArrowFunction = Fuzzilli_Protobuf_EndAsyncArrowFunction()
-            case let op as BeginAsyncGeneratorFunction:
+            case .beginAsyncGeneratorFunction(let op):
                 $0.beginAsyncGeneratorFunction = Fuzzilli_Protobuf_BeginAsyncGeneratorFunction.with {
                     $0.parameters = convertParameters(op.parameters)
                     $0.isStrict = op.isStrict
                 }
-            case is EndAsyncGeneratorFunction:
+            case .endAsyncGeneratorFunction:
                 $0.endAsyncGeneratorFunction = Fuzzilli_Protobuf_EndAsyncGeneratorFunction()
-            case let op as BeginConstructor:
+            case .beginConstructor(let op):
                 $0.beginConstructor = Fuzzilli_Protobuf_BeginConstructor.with {
                     $0.parameters = convertParameters(op.parameters)
                 }
-            case is EndConstructor:
+            case .endConstructor:
                 $0.endConstructor = Fuzzilli_Protobuf_EndConstructor()
-            case is Return:
+            case .return:
                 $0.return = Fuzzilli_Protobuf_Return()
-            case is Yield:
+            case .yield:
                 $0.yield = Fuzzilli_Protobuf_Yield()
-            case is YieldEach:
+            case .yieldEach:
                 $0.yieldEach = Fuzzilli_Protobuf_YieldEach()
-            case is Await:
+            case .await:
                 $0.await = Fuzzilli_Protobuf_Await()
-            case is CallFunction:
+            case .callFunction:
                 $0.callFunction = Fuzzilli_Protobuf_CallFunction()
-            case let op as CallFunctionWithSpread:
+            case .callFunctionWithSpread(let op):
                 $0.callFunctionWithSpread = Fuzzilli_Protobuf_CallFunctionWithSpread.with { $0.spreads = op.spreads }
-            case is Construct:
+            case .construct:
                 $0.construct = Fuzzilli_Protobuf_Construct()
-            case let op as ConstructWithSpread:
+            case .constructWithSpread(let op):
                 $0.constructWithSpread = Fuzzilli_Protobuf_ConstructWithSpread.with { $0.spreads = op.spreads }
-            case let op as CallMethod:
+            case .callMethod(let op):
                 $0.callMethod = Fuzzilli_Protobuf_CallMethod.with {
                     $0.methodName = op.methodName
                 }
-            case let op as CallMethodWithSpread:
+            case .callMethodWithSpread(let op):
                 $0.callMethodWithSpread = Fuzzilli_Protobuf_CallMethodWithSpread.with {
                     $0.methodName = op.methodName
                     $0.spreads = op.spreads
                 }
-            case is CallComputedMethod:
+            case .callComputedMethod:
                 $0.callComputedMethod = Fuzzilli_Protobuf_CallComputedMethod()
-            case let op as CallComputedMethodWithSpread:
+            case .callComputedMethodWithSpread(let op):
                 $0.callComputedMethodWithSpread = Fuzzilli_Protobuf_CallComputedMethodWithSpread.with { $0.spreads = op.spreads }
-            case let op as UnaryOperation:
+            case .unaryOperation(let op):
                 $0.unaryOperation = Fuzzilli_Protobuf_UnaryOperation.with { $0.op = convertEnum(op.op, UnaryOperator.allCases) }
-            case let op as BinaryOperation:
+            case .binaryOperation(let op):
                 $0.binaryOperation = Fuzzilli_Protobuf_BinaryOperation.with { $0.op = convertEnum(op.op, BinaryOperator.allCases) }
-            case let op as ReassignWithBinop:
-                $0.reassignWithBinop = Fuzzilli_Protobuf_ReassignWithBinop.with { $0.op = convertEnum(op.op, BinaryOperator.allCases) }
-            case is Dup:
-                $0.dup = Fuzzilli_Protobuf_Dup()
-            case is Reassign:
+            case .ternaryOperation:
+                $0.ternaryOperation = Fuzzilli_Protobuf_TernaryOperation()
+            case .reassign:
                 $0.reassign = Fuzzilli_Protobuf_Reassign()
-            case let op as DestructArray:
+            case .update(let op):
+                $0.update = Fuzzilli_Protobuf_Update.with { $0.op = convertEnum(op.op, BinaryOperator.allCases) }
+            case .dup:
+                $0.dup = Fuzzilli_Protobuf_Dup()
+            case .destructArray(let op):
                 $0.destructArray = Fuzzilli_Protobuf_DestructArray.with {
                     $0.indices = op.indices.map({ Int32($0) })
-                    $0.hasRestElement_p = op.hasRestElement
+                    $0.lastIsRest = op.lastIsRest
                 }
-            case let op as DestructArrayAndReassign:
+            case .destructArrayAndReassign(let op):
                 $0.destructArrayAndReassign = Fuzzilli_Protobuf_DestructArrayAndReassign.with {
                     $0.indices = op.indices.map({ Int32($0) })
-                    $0.hasRestElement_p = op.hasRestElement
+                    $0.lastIsRest = op.lastIsRest
                 }
-            case let op as DestructObject:
+            case .destructObject(let op):
                 $0.destructObject = Fuzzilli_Protobuf_DestructObject.with {
                     $0.properties = op.properties
                     $0.hasRestElement_p = op.hasRestElement
                 }
-            case let op as DestructObjectAndReassign:
+            case .destructObjectAndReassign(let op):
                 $0.destructObjectAndReassign = Fuzzilli_Protobuf_DestructObjectAndReassign.with {
                     $0.properties = op.properties
                     $0.hasRestElement_p = op.hasRestElement
                 }
-            case let op as Compare:
+            case .compare(let op):
                 $0.compare = Fuzzilli_Protobuf_Compare.with { $0.op = convertEnum(op.op, Comparator.allCases) }
-            case is ConditionalOperation:
-                $0.conditionalOperation = Fuzzilli_Protobuf_ConditionalOperation()
-            case let op as Eval:
-                $0.eval = Fuzzilli_Protobuf_Eval.with { $0.code = op.code }
-            case let op as BeginClass:
-                $0.beginClass = Fuzzilli_Protobuf_BeginClass.with {
-                    $0.hasSuperclass_p = op.hasSuperclass
-                    $0.constructorParameters = convertParameters(op.constructorParameters)
-                    $0.instanceProperties = op.instanceProperties
-                    $0.instanceMethodNames = op.instanceMethods.map({ $0.name })
-                    $0.instanceMethodParameters = op.instanceMethods.map({ convertParameters($0.parameters) })
+            case .loadNamedVariable(let op):
+                $0.loadNamedVariable = Fuzzilli_Protobuf_LoadNamedVariable.with { $0.variableName = op.variableName }
+            case .storeNamedVariable(let op):
+                $0.storeNamedVariable = Fuzzilli_Protobuf_StoreNamedVariable.with { $0.variableName = op.variableName }
+            case .defineNamedVariable(let op):
+                $0.defineNamedVariable = Fuzzilli_Protobuf_DefineNamedVariable.with { $0.variableName = op.variableName }
+            case .eval(let op):
+                $0.eval = Fuzzilli_Protobuf_Eval.with {
+                    $0.code = op.code
+                    $0.hasOutput_p = op.hasOutput
                 }
-            case let op as BeginMethod:
-                $0.beginMethod = Fuzzilli_Protobuf_BeginMethod.with { $0.numParameters = UInt32(op.numParameters) }
-            case is EndClass:
-                $0.endClass = Fuzzilli_Protobuf_EndClass()
-            case is CallSuperConstructor:
+            case .callSuperConstructor:
                 $0.callSuperConstructor = Fuzzilli_Protobuf_CallSuperConstructor()
-            case let op as CallSuperMethod:
+            case .callSuperMethod(let op):
                 $0.callSuperMethod = Fuzzilli_Protobuf_CallSuperMethod.with { $0.methodName = op.methodName }
-            case let op as LoadSuperProperty:
-                $0.loadSuperProperty = Fuzzilli_Protobuf_LoadSuperProperty.with { $0.propertyName = op.propertyName }
-            case let op as StoreSuperProperty:
-                $0.storeSuperProperty = Fuzzilli_Protobuf_StoreSuperProperty.with { $0.propertyName = op.propertyName }
-            case let op as StoreSuperPropertyWithBinop:
-                $0.storeSuperPropertyWithBinop = Fuzzilli_Protobuf_StoreSuperPropertyWithBinop.with {
+            case .getPrivateProperty(let op):
+                $0.getPrivateProperty = Fuzzilli_Protobuf_GetPrivateProperty.with { $0.propertyName = op.propertyName }
+            case .setPrivateProperty(let op):
+                $0.setPrivateProperty = Fuzzilli_Protobuf_SetPrivateProperty.with { $0.propertyName = op.propertyName }
+            case .updatePrivateProperty(let op):
+                $0.updatePrivateProperty = Fuzzilli_Protobuf_UpdatePrivateProperty.with {
                     $0.propertyName = op.propertyName
                     $0.op = convertEnum(op.op, BinaryOperator.allCases)
                 }
-            case let op as Explore:
+            case .callPrivateMethod(let op):
+                $0.callPrivateMethod = Fuzzilli_Protobuf_CallPrivateMethod.with { $0.methodName = op.methodName }
+            case .getSuperProperty(let op):
+                $0.getSuperProperty = Fuzzilli_Protobuf_GetSuperProperty.with { $0.propertyName = op.propertyName }
+            case .setSuperProperty(let op):
+                $0.setSuperProperty = Fuzzilli_Protobuf_SetSuperProperty.with { $0.propertyName = op.propertyName }
+            case .updateSuperProperty(let op):
+                $0.updateSuperProperty = Fuzzilli_Protobuf_UpdateSuperProperty.with {
+                    $0.propertyName = op.propertyName
+                    $0.op = convertEnum(op.op, BinaryOperator.allCases)
+                }
+            case .explore(let op):
                 $0.explore = Fuzzilli_Protobuf_Explore.with { $0.id = op.id }
-            case let op as Probe:
+            case .probe(let op):
                 $0.probe = Fuzzilli_Protobuf_Probe.with { $0.id = op.id }
-            case is BeginWith:
+            case .beginWith:
                 $0.beginWith = Fuzzilli_Protobuf_BeginWith()
-            case is EndWith:
+            case .endWith:
                 $0.endWith = Fuzzilli_Protobuf_EndWith()
-            case let op as LoadFromScope:
-                $0.loadFromScope = Fuzzilli_Protobuf_LoadFromScope.with { $0.id = op.id }
-            case let op as StoreToScope:
-                $0.storeToScope = Fuzzilli_Protobuf_StoreToScope.with { $0.id = op.id }
-            case let op as BeginIf:
+            case .beginIf(let op):
                 $0.beginIf = Fuzzilli_Protobuf_BeginIf.with {
                     $0.inverted = op.inverted
                 }
-            case is BeginElse:
+            case .beginElse:
                 $0.beginElse = Fuzzilli_Protobuf_BeginElse()
-            case is EndIf:
+            case .endIf:
                 $0.endIf = Fuzzilli_Protobuf_EndIf()
-            case is BeginSwitch:
+            case .beginSwitch:
                 $0.beginSwitch = Fuzzilli_Protobuf_BeginSwitch()
-            case is BeginSwitchCase:
+            case .beginSwitchCase:
                 $0.beginSwitchCase = Fuzzilli_Protobuf_BeginSwitchCase()
-            case is BeginSwitchDefaultCase:
+            case .beginSwitchDefaultCase:
                 $0.beginSwitchDefaultCase = Fuzzilli_Protobuf_BeginSwitchDefaultCase()
-            case is SwitchBreak:
+            case .switchBreak:
                 $0.switchBreak = Fuzzilli_Protobuf_SwitchBreak()
-            case let op as EndSwitchCase:
+            case .endSwitchCase(let op):
                 $0.endSwitchCase = Fuzzilli_Protobuf_EndSwitchCase.with { $0.fallsThrough = op.fallsThrough }
-            case is EndSwitch:
+            case .endSwitch:
                 $0.endSwitch = Fuzzilli_Protobuf_EndSwitch()
-            case let op as BeginWhileLoop:
+            case .beginWhileLoop(let op):
                 $0.beginWhile = Fuzzilli_Protobuf_BeginWhile.with { $0.comparator = convertEnum(op.comparator, Comparator.allCases) }
-            case is EndWhileLoop:
+            case .endWhileLoop:
                 $0.endWhile = Fuzzilli_Protobuf_EndWhile()
-            case let op as BeginDoWhileLoop:
+            case .beginDoWhileLoop(let op):
                 $0.beginDoWhile = Fuzzilli_Protobuf_BeginDoWhile.with { $0.comparator = convertEnum(op.comparator, Comparator.allCases) }
-            case is EndDoWhileLoop:
+            case .endDoWhileLoop:
                 $0.endDoWhile = Fuzzilli_Protobuf_EndDoWhile()
-            case let op as BeginForLoop:
+            case .beginForLoop(let op):
                 $0.beginFor = Fuzzilli_Protobuf_BeginFor.with {
                     $0.comparator = convertEnum(op.comparator, Comparator.allCases)
                     $0.op = convertEnum(op.op, BinaryOperator.allCases)
                 }
-            case is EndForLoop:
+            case .endForLoop:
                 $0.endFor = Fuzzilli_Protobuf_EndFor()
-            case is BeginForInLoop:
+            case .beginForInLoop:
                 $0.beginForIn = Fuzzilli_Protobuf_BeginForIn()
-            case is EndForInLoop:
+            case .endForInLoop:
                 $0.endForIn = Fuzzilli_Protobuf_EndForIn()
-            case is BeginForOfLoop:
+            case .beginForOfLoop:
                 $0.beginForOf = Fuzzilli_Protobuf_BeginForOf()
-            case let op as BeginForOfWithDestructLoop:
+            case .beginForOfWithDestructLoop(let op):
                 $0.beginForOfWithDestruct = Fuzzilli_Protobuf_BeginForOfWithDestruct.with {
                     $0.indices = op.indices.map({ Int32($0) })
                     $0.hasRestElement_p = op.hasRestElement
                 }
-            case is EndForOfLoop:
+            case .endForOfLoop:
                 $0.endForOf = Fuzzilli_Protobuf_EndForOf()
-            case let op as BeginRepeatLoop:
+            case .beginRepeatLoop(let op):
                 $0.beginRepeat = Fuzzilli_Protobuf_BeginRepeat.with { $0.iterations = Int64(op.iterations) }
-            case is EndRepeatLoop:
+            case .endRepeatLoop:
                 $0.endRepeat = Fuzzilli_Protobuf_EndRepeat()
-            case is LoopBreak:
+            case .loopBreak:
                 $0.loopBreak = Fuzzilli_Protobuf_LoopBreak()
-            case is LoopContinue:
+            case .loopContinue:
                 $0.loopContinue = Fuzzilli_Protobuf_LoopContinue()
-            case is BeginTry:
+            case .beginTry:
                 $0.beginTry = Fuzzilli_Protobuf_BeginTry()
-            case is BeginCatch:
+            case .beginCatch:
                 $0.beginCatch = Fuzzilli_Protobuf_BeginCatch()
-            case is BeginFinally:
+            case .beginFinally:
                 $0.beginFinally = Fuzzilli_Protobuf_BeginFinally()
-            case is EndTryCatchFinally:
+            case .endTryCatchFinally:
                 $0.endTryCatch = Fuzzilli_Protobuf_EndTryCatch()
-            case is ThrowException:
+            case .throwException:
                 $0.throwException = Fuzzilli_Protobuf_ThrowException()
-            case is BeginCodeString:
+            case .beginCodeString:
                 $0.beginCodeString = Fuzzilli_Protobuf_BeginCodeString()
-            case is EndCodeString:
+            case .endCodeString:
                 $0.endCodeString = Fuzzilli_Protobuf_EndCodeString()
-            case is BeginBlockStatement:
+            case .beginBlockStatement:
                 $0.beginBlockStatement = Fuzzilli_Protobuf_BeginBlockStatement()
-            case is EndBlockStatement:
+            case .endBlockStatement:
                 $0.endBlockStatement = Fuzzilli_Protobuf_EndBlockStatement()
-            default:
-                fatalError("Unhandled operation type in protobuf conversion: \(op)")
+            case .print(_):
+                fatalError("Print operations should not be serialized")
             }
         }
 
@@ -674,34 +801,120 @@ extension Instruction: ProtobufConvertible {
             op = LoadString(value: p.value)
         case .loadBoolean(let p):
             op = LoadBoolean(value: p.value)
-        case .loadUndefined(_):
+        case .loadUndefined:
             op = LoadUndefined()
-        case .loadNull(_):
+        case .loadNull:
             op = LoadNull()
-        case .loadThis(_):
+        case .loadThis:
             op = LoadThis()
-        case .loadArguments(_):
+        case .loadArguments:
             op = LoadArguments()
         case .loadRegExp(let p):
-            op = LoadRegExp(value: p.value, flags: RegExpFlags(rawValue: p.flags))
-        case .createObject(let p):
-            op = CreateObject(propertyNames: p.propertyNames)
-        case .createArray(_):
+            op = LoadRegExp(pattern: p.pattern, flags: RegExpFlags(rawValue: p.flags))
+        case .beginObjectLiteral:
+            op = BeginObjectLiteral()
+        case .objectLiteralAddProperty(let p):
+            op = ObjectLiteralAddProperty(propertyName: p.propertyName)
+        case .objectLiteralAddElement(let p):
+            op = ObjectLiteralAddElement(index: p.index)
+        case .objectLiteralAddComputedProperty:
+            op = ObjectLiteralAddComputedProperty()
+        case .objectLiteralCopyProperties:
+            op = ObjectLiteralCopyProperties()
+        case .objectLiteralSetPrototype:
+            op = ObjectLiteralSetPrototype()
+        case .beginObjectLiteralMethod(let p):
+            op = BeginObjectLiteralMethod(methodName: p.methodName, parameters: convertParameters(p.parameters))
+        case .endObjectLiteralMethod:
+            op = EndObjectLiteralMethod()
+        case .beginObjectLiteralGetter(let p):
+            op = BeginObjectLiteralGetter(propertyName: p.propertyName)
+        case .endObjectLiteralGetter:
+            op = EndObjectLiteralGetter()
+        case .beginObjectLiteralSetter(let p):
+            op = BeginObjectLiteralSetter(propertyName: p.propertyName)
+        case .endObjectLiteralSetter:
+            op = EndObjectLiteralSetter()
+        case .endObjectLiteral:
+            op = EndObjectLiteral()
+        case .beginClassDefinition(let p):
+            op = BeginClassDefinition(hasSuperclass: p.hasSuperclass_p)
+        case .beginClassConstructor(let p):
+            op = BeginClassConstructor(parameters: convertParameters(p.parameters))
+        case .endClassConstructor:
+            op = EndClassConstructor()
+        case .classAddInstanceProperty(let p):
+            op = ClassAddInstanceProperty(propertyName: p.propertyName, hasValue: p.hasValue_p)
+        case .classAddInstanceElement(let p):
+            op = ClassAddInstanceElement(index: p.index, hasValue: p.hasValue_p)
+        case .classAddInstanceComputedProperty(let p):
+            op = ClassAddInstanceComputedProperty(hasValue: p.hasValue_p)
+        case .beginClassInstanceMethod(let p):
+            op = BeginClassInstanceMethod(methodName: p.methodName, parameters: convertParameters(p.parameters))
+        case .endClassInstanceMethod:
+            op = EndClassInstanceMethod()
+        case .beginClassInstanceGetter(let p):
+            op = BeginClassInstanceGetter(propertyName: p.propertyName)
+        case .endClassInstanceGetter:
+            op = EndClassInstanceGetter()
+        case .beginClassInstanceSetter(let p):
+            op = BeginClassInstanceSetter(propertyName: p.propertyName)
+        case .endClassInstanceSetter:
+            op = EndClassInstanceSetter()
+        case .classAddStaticProperty(let p):
+            op = ClassAddStaticProperty(propertyName: p.propertyName, hasValue: p.hasValue_p)
+        case .classAddStaticElement(let p):
+            op = ClassAddStaticElement(index: p.index, hasValue: p.hasValue_p)
+        case .classAddStaticComputedProperty(let p):
+            op = ClassAddStaticComputedProperty(hasValue: p.hasValue_p)
+        case .beginClassStaticInitializer:
+            op = BeginClassStaticInitializer()
+        case .endClassStaticInitializer:
+            op = EndClassStaticInitializer()
+        case .beginClassStaticMethod(let p):
+            op = BeginClassStaticMethod(methodName: p.methodName, parameters: convertParameters(p.parameters))
+        case .endClassStaticMethod:
+            op = EndClassStaticMethod()
+        case .beginClassStaticGetter(let p):
+            op = BeginClassStaticGetter(propertyName: p.propertyName)
+        case .endClassStaticGetter:
+            op = EndClassStaticGetter()
+        case .beginClassStaticSetter(let p):
+            op = BeginClassStaticSetter(propertyName: p.propertyName)
+        case .endClassStaticSetter:
+            op = EndClassStaticSetter()
+        case .classAddPrivateInstanceProperty(let p):
+            op = ClassAddPrivateInstanceProperty(propertyName: p.propertyName, hasValue: p.hasValue_p)
+        case .beginClassPrivateInstanceMethod(let p):
+            op = BeginClassPrivateInstanceMethod(methodName: p.methodName, parameters: convertParameters(p.parameters))
+        case .endClassPrivateInstanceMethod:
+            op = EndClassPrivateInstanceMethod()
+        case .classAddPrivateStaticProperty(let p):
+            op = ClassAddPrivateStaticProperty(propertyName: p.propertyName, hasValue: p.hasValue_p)
+        case .beginClassPrivateStaticMethod(let p):
+            op = BeginClassPrivateStaticMethod(methodName: p.methodName, parameters: convertParameters(p.parameters))
+        case .endClassPrivateStaticMethod:
+            op = EndClassPrivateStaticMethod()
+        case .endClassDefinition:
+            op = EndClassDefinition()
+        case .createArray:
             op = CreateArray(numInitialValues: inouts.count - 1)
-        case .createObjectWithSpread(let p):
-            op = CreateObjectWithSpread(propertyNames: p.propertyNames, numSpreads: inouts.count - 1 - p.propertyNames.count)
+        case .createIntArray(let p):
+            op = CreateIntArray(values: p.values)
+        case .createFloatArray(let p):
+            op = CreateFloatArray(values: p.values)
         case .createArrayWithSpread(let p):
             op = CreateArrayWithSpread(spreads: p.spreads)
         case .createTemplateString(let p):
             op = CreateTemplateString(parts: p.parts)
         case .loadBuiltin(let p):
             op = LoadBuiltin(builtinName: p.builtinName)
-        case .loadProperty(let p):
-            op = LoadProperty(propertyName: p.propertyName)
-        case .storeProperty(let p):
-            op = StoreProperty(propertyName: p.propertyName)
-        case .storePropertyWithBinop(let p):
-            op = StorePropertyWithBinop(propertyName: p.propertyName, operator: try convertEnum(p.op, BinaryOperator.allCases))
+        case .getProperty(let p):
+            op = GetProperty(propertyName: p.propertyName)
+        case .setProperty(let p):
+            op = SetProperty(propertyName: p.propertyName)
+        case .updateProperty(let p):
+            op = UpdateProperty(propertyName: p.propertyName, operator: try convertEnum(p.op, BinaryOperator.allCases))
         case .deleteProperty(let p):
             op = DeleteProperty(propertyName: p.propertyName)
         case .configureProperty(let p):
@@ -710,12 +923,12 @@ extension Instruction: ProtobufConvertible {
             if p.isConfigurable { flags.insert(.configurable) }
             if p.isEnumerable { flags.insert(.enumerable) }
             op = ConfigureProperty(propertyName: p.propertyName, flags: flags, type: try convertEnum(p.type, PropertyType.allCases))
-        case .loadElement(let p):
-            op = LoadElement(index: p.index)
-        case .storeElement(let p):
-            op = StoreElement(index: p.index)
-        case .storeElementWithBinop(let p):
-            op = StoreElementWithBinop(index: p.index, operator: try convertEnum(p.op, BinaryOperator.allCases))
+        case .getElement(let p):
+            op = GetElement(index: p.index)
+        case .setElement(let p):
+            op = SetElement(index: p.index)
+        case .updateElement(let p):
+            op = UpdateElement(index: p.index, operator: try convertEnum(p.op, BinaryOperator.allCases))
         case .deleteElement(let p):
             op = DeleteElement(index: p.index)
         case .configureElement(let p):
@@ -724,13 +937,13 @@ extension Instruction: ProtobufConvertible {
             if p.isConfigurable { flags.insert(.configurable) }
             if p.isEnumerable { flags.insert(.enumerable) }
             op = ConfigureElement(index: p.index, flags: flags, type: try convertEnum(p.type, PropertyType.allCases))
-        case .loadComputedProperty(_):
-            op = LoadComputedProperty()
-        case .storeComputedProperty(_):
-            op = StoreComputedProperty()
-        case .storeComputedPropertyWithBinop(let p):
-            op = StoreComputedPropertyWithBinop(operator: try convertEnum(p.op, BinaryOperator.allCases))
-        case .deleteComputedProperty(_):
+        case .getComputedProperty:
+            op = GetComputedProperty()
+        case .setComputedProperty:
+            op = SetComputedProperty()
+        case .updateComputedProperty(let p):
+            op = UpdateComputedProperty(operator: try convertEnum(p.op, BinaryOperator.allCases))
+        case .deleteComputedProperty:
             op = DeleteComputedProperty()
         case .configureComputedProperty(let p):
             var flags = PropertyFlags()
@@ -738,60 +951,62 @@ extension Instruction: ProtobufConvertible {
             if p.isConfigurable { flags.insert(.configurable) }
             if p.isEnumerable { flags.insert(.enumerable) }
             op = ConfigureComputedProperty(flags: flags, type: try convertEnum(p.type, PropertyType.allCases))
-        case .typeOf(_):
+        case .typeOf:
             op = TypeOf()
-        case .testInstanceOf(_):
+        case .testInstanceOf:
             op = TestInstanceOf()
-        case .testIn(_):
+        case .testIn:
             op = TestIn()
         case .beginPlainFunction(let p):
             let parameters = convertParameters(p.parameters)
             op = BeginPlainFunction(parameters: parameters, isStrict: p.isStrict)
-        case .endPlainFunction(_):
+        case .endPlainFunction:
             op = EndPlainFunction()
         case .beginArrowFunction(let p):
             let parameters = convertParameters(p.parameters)
             op = BeginArrowFunction(parameters: parameters, isStrict: p.isStrict)
-        case .endArrowFunction(_):
+        case .endArrowFunction:
             op = EndArrowFunction()
         case .beginGeneratorFunction(let p):
             let parameters = convertParameters(p.parameters)
             op = BeginGeneratorFunction(parameters: parameters, isStrict: p.isStrict)
-        case .endGeneratorFunction(_):
+        case .endGeneratorFunction:
             op = EndGeneratorFunction()
         case .beginAsyncFunction(let p):
             let parameters = convertParameters(p.parameters)
             op = BeginAsyncFunction(parameters: parameters, isStrict: p.isStrict)
-        case .endAsyncFunction(_):
+        case .endAsyncFunction:
             op = EndAsyncFunction()
         case .beginAsyncArrowFunction(let p):
             let parameters = convertParameters(p.parameters)
             op = BeginAsyncArrowFunction(parameters: parameters, isStrict: p.isStrict)
-        case .endAsyncArrowFunction(_):
+        case .endAsyncArrowFunction:
             op = EndAsyncArrowFunction()
         case .beginAsyncGeneratorFunction(let p):
             let parameters = convertParameters(p.parameters)
             op = BeginAsyncGeneratorFunction(parameters: parameters, isStrict: p.isStrict)
-        case .endAsyncGeneratorFunction(_):
+        case .endAsyncGeneratorFunction:
             op = EndAsyncGeneratorFunction()
         case .beginConstructor(let p):
             let parameters = convertParameters(p.parameters)
             op = BeginConstructor(parameters: parameters)
-        case .endConstructor(_):
+        case .endConstructor:
             op = EndConstructor()
-        case .return(_):
-            op = Return()
-        case .yield(_):
-            op = Yield()
-        case .yieldEach(_):
+        case .return:
+            let hasReturnValue = inouts.count == 1
+            op = Return(hasReturnValue: hasReturnValue)
+        case .yield:
+            let hasArgument = inouts.count == 2
+            op = Yield(hasArgument: hasArgument)
+        case .yieldEach:
             op = YieldEach()
-        case .await(_):
+        case .await:
             op = Await()
-        case .callFunction(_):
+        case .callFunction:
             op = CallFunction(numArguments: inouts.count - 2)
         case .callFunctionWithSpread(let p):
             op = CallFunctionWithSpread(numArguments: inouts.count - 2, spreads: p.spreads)
-        case .construct(_):
+        case .construct:
             op = Construct(numArguments: inouts.count - 2)
         case .constructWithSpread(let p):
             op = ConstructWithSpread(numArguments: inouts.count - 2, spreads: p.spreads)
@@ -799,7 +1014,7 @@ extension Instruction: ProtobufConvertible {
             op = CallMethod(methodName: p.methodName, numArguments: inouts.count - 2)
         case .callMethodWithSpread(let p):
             op = CallMethodWithSpread(methodName: p.methodName, numArguments: inouts.count - 2, spreads: p.spreads)
-        case .callComputedMethod(_):
+        case .callComputedMethod:
             op = CallComputedMethod(numArguments: inouts.count - 3)
         case .callComputedMethodWithSpread(let p):
             op = CallComputedMethodWithSpread(numArguments: inouts.count - 3, spreads: p.spreads)
@@ -807,124 +1022,126 @@ extension Instruction: ProtobufConvertible {
             op = UnaryOperation(try convertEnum(p.op, UnaryOperator.allCases))
         case .binaryOperation(let p):
             op = BinaryOperation(try convertEnum(p.op, BinaryOperator.allCases))
-        case .reassignWithBinop(let p):
-            op = ReassignWithBinop(try convertEnum(p.op, BinaryOperator.allCases))
-        case .dup(_):
+        case .ternaryOperation:
+            op = TernaryOperation()
+        case .update(let p):
+            op = Update(try convertEnum(p.op, BinaryOperator.allCases))
+        case .dup:
             op = Dup()
-        case .reassign(_):
+        case .reassign:
             op = Reassign()
         case .destructArray(let p):
-            op = DestructArray(indices: p.indices.map({ Int64($0) }), hasRestElement: p.hasRestElement_p)
+            op = DestructArray(indices: p.indices.map({ Int64($0) }), lastIsRest: p.lastIsRest)
         case .destructArrayAndReassign(let p):
-            op = DestructArrayAndReassign(indices: p.indices.map({ Int64($0) }), hasRestElement: p.hasRestElement_p)
+            op = DestructArrayAndReassign(indices: p.indices.map({ Int64($0) }), lastIsRest: p.lastIsRest)
         case .destructObject(let p):
             op = DestructObject(properties: p.properties, hasRestElement: p.hasRestElement_p)
         case .destructObjectAndReassign(let p):
             op = DestructObjectAndReassign(properties: p.properties, hasRestElement: p.hasRestElement_p)
         case .compare(let p):
             op = Compare(try convertEnum(p.op, Comparator.allCases))
-        case .conditionalOperation(_):
-            op = ConditionalOperation()
+        case .loadNamedVariable(let p):
+            op = LoadNamedVariable(p.variableName)
+        case .storeNamedVariable(let p):
+            op = StoreNamedVariable(p.variableName)
+        case .defineNamedVariable(let p):
+            op = DefineNamedVariable(p.variableName)
         case .eval(let p):
-            op = Eval(p.code, numArguments: inouts.count)
-        case .beginClass(let p):
-            op = BeginClass(hasSuperclass: p.hasSuperclass_p,
-                            constructorParameters: convertParameters(p.constructorParameters),
-                            instanceProperties: p.instanceProperties,
-                            instanceMethods: Array(zip(p.instanceMethodNames, p.instanceMethodParameters.map(convertParameters))))
-        case .beginMethod(let p):
-            op = BeginMethod(numParameters: Int(p.numParameters))
-        case .endClass(_):
-            op = EndClass()
-        case .callSuperConstructor(_):
+            let numArguments = inouts.count - (p.hasOutput_p ? 1 : 0)
+            op = Eval(p.code, numArguments: numArguments, hasOutput: p.hasOutput_p)
+        case .callSuperConstructor:
             op = CallSuperConstructor(numArguments: inouts.count)
         case .callSuperMethod(let p):
             op = CallSuperMethod(methodName: p.methodName, numArguments: inouts.count - 1)
-        case .loadSuperProperty(let p):
-            op = LoadSuperProperty(propertyName: p.propertyName)
-        case .storeSuperProperty(let p):
-            op = StoreSuperProperty(propertyName: p.propertyName)
-        case .storeSuperPropertyWithBinop(let p):
-            op = StoreSuperPropertyWithBinop(propertyName: p.propertyName, operator: try convertEnum(p.op, BinaryOperator.allCases))
+        case .getPrivateProperty(let p):
+            op = GetPrivateProperty(propertyName: p.propertyName)
+        case .setPrivateProperty(let p):
+            op = SetPrivateProperty(propertyName: p.propertyName)
+        case .updatePrivateProperty(let p):
+            op = UpdatePrivateProperty(propertyName: p.propertyName, operator: try convertEnum(p.op, BinaryOperator.allCases))
+        case .callPrivateMethod(let p):
+            op = CallPrivateMethod(methodName: p.methodName, numArguments: inouts.count - 2)
+        case .getSuperProperty(let p):
+            op = GetSuperProperty(propertyName: p.propertyName)
+        case .setSuperProperty(let p):
+            op = SetSuperProperty(propertyName: p.propertyName)
+        case .updateSuperProperty(let p):
+            op = UpdateSuperProperty(propertyName: p.propertyName, operator: try convertEnum(p.op, BinaryOperator.allCases))
         case .explore(let p):
             op = Explore(id: p.id, numArguments: inouts.count - 1)
         case .probe(let p):
             op = Probe(id: p.id)
-        case .beginWith(_):
+        case .beginWith:
             op = BeginWith()
-        case .endWith(_):
+        case .endWith:
             op = EndWith()
-        case .loadFromScope(let p):
-            op = LoadFromScope(id: p.id)
-        case .storeToScope(let p):
-            op = StoreToScope(id: p.id)
         case .beginIf(let p):
             op = BeginIf(inverted: p.inverted)
-        case .beginElse(_):
+        case .beginElse:
             op = BeginElse()
-        case .endIf(_):
+        case .endIf:
             op = EndIf()
-        case .beginSwitch(_):
+        case .beginSwitch:
             op = BeginSwitch()
-        case .beginSwitchCase(_):
+        case .beginSwitchCase:
             op = BeginSwitchCase()
-        case .beginSwitchDefaultCase(_):
+        case .beginSwitchDefaultCase:
             op = BeginSwitchDefaultCase()
-        case .switchBreak(_):
+        case .switchBreak:
             op = SwitchBreak()
         case .endSwitchCase(let p):
             op = EndSwitchCase(fallsThrough: p.fallsThrough)
-        case .endSwitch(_):
+        case .endSwitch:
             op = EndSwitch()
         case .beginWhile(let p):
             op = BeginWhileLoop(comparator: try convertEnum(p.comparator, Comparator.allCases))
-        case .endWhile(_):
+        case .endWhile:
             op = EndWhileLoop()
         case .beginDoWhile(let p):
             op = BeginDoWhileLoop(comparator: try convertEnum(p.comparator, Comparator.allCases))
-        case .endDoWhile(_):
+        case .endDoWhile:
             op = EndDoWhileLoop()
         case .beginFor(let p):
             op = BeginForLoop(comparator: try convertEnum(p.comparator, Comparator.allCases), op: try convertEnum(p.op, BinaryOperator.allCases))
-        case .endFor(_):
+        case .endFor:
             op = EndForLoop()
-        case .beginForIn(_):
+        case .beginForIn:
             op = BeginForInLoop()
-        case .endForIn(_):
+        case .endForIn:
             op = EndForInLoop()
-        case .beginForOf(_):
+        case .beginForOf:
             op = BeginForOfLoop()
         case .beginForOfWithDestruct(let p):
             op = BeginForOfWithDestructLoop(indices: p.indices.map({ Int64($0) }), hasRestElement: p.hasRestElement_p)
-        case .endForOf(_):
+        case .endForOf:
             op = EndForOfLoop()
         case .beginRepeat(let p):
             op = BeginRepeatLoop(iterations: Int(p.iterations))
-        case .endRepeat(_):
+        case .endRepeat:
             op = EndRepeatLoop()
-        case .loopBreak(_):
+        case .loopBreak:
             op = LoopBreak()
-        case .loopContinue(_):
+        case .loopContinue:
             op = LoopContinue()
-        case .beginTry(_):
+        case .beginTry:
             op = BeginTry()
-        case .beginCatch(_):
+        case .beginCatch:
             op = BeginCatch()
-        case .beginFinally(_):
+        case .beginFinally:
             op = BeginFinally()
-        case .endTryCatch(_):
+        case .endTryCatch:
             op = EndTryCatchFinally()
-        case .throwException(_):
+        case .throwException:
             op = ThrowException()
-        case .beginCodeString(_):
+        case .beginCodeString:
             op = BeginCodeString()
-        case .endCodeString(_):
+        case .endCodeString:
             op = EndCodeString()
-        case .beginBlockStatement(_):
+        case .beginBlockStatement:
             op = BeginBlockStatement()
-        case .endBlockStatement(_):
+        case .endBlockStatement:
             op = EndBlockStatement()
-        case .nop(_):
+        case .nop:
             op = Nop()
         }
 

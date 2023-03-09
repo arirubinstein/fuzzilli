@@ -16,6 +16,9 @@
 public struct Code: Collection {
     public typealias Element = Instruction
 
+    /// The maximum number of variables. This restriction arises from the fact that variables and instruction indices are stored internally as UInt16
+    public static let maxNumberOfVariables = 0x10000
+
     /// Code is just a linear sequence of instructions.
     private var instructions = [Instruction]()
 
@@ -143,7 +146,7 @@ public struct Code: Collection {
         return Variable(number: 0)
     }
 
-    /// Renumbers variables so that their numbers are again contiguous.
+    /// Renumbers variables so that their numbers are again continuous.
     /// This can be useful after instructions have been reordered, for example for the purpose of minimization.
     public mutating func renumberVariables() {
         var numVariables = 0
@@ -158,6 +161,20 @@ public struct Code: Collection {
             let inouts = instr.inouts.map({ varMap[$0]! })
             self[idx] = Instruction(instr.op, inouts: inouts)
         }
+    }
+
+    /// Returns true if the variables in this code are numbered continuously.
+    public func variablesAreNumberedContinuously() -> Bool {
+        var definedVariables = VariableSet()
+        for instr in self {
+            for v in instr.allOutputs {
+                guard v.number == 0 || definedVariables.contains(Variable(number: v.number - 1)) else {
+                    return false
+                }
+                definedVariables.insert(v)
+            }
+        }
+        return true
     }
 
     /// Remove all nop instructions from this code.
@@ -175,8 +192,7 @@ public struct Code: Collection {
         var visibleScopes = [scopeCounter]
         var contextAnalyzer = ContextAnalyzer()
         var blockHeads = [Operation]()
-        var defaultSwitchCaseStack: [Bool] = []
-        var classDefinitions = ClassDefinitionStack()
+        var defaultSwitchCaseStack = Stack<Bool>()
 
         func defineVariable(_ v: Variable, in scope: Int) throws {
             guard !definedVariables.contains(v) else {
@@ -225,16 +241,7 @@ public struct Code: Collection {
 
                 // Switch Case semantic verification
                 if instr.op is EndSwitch {
-                    defaultSwitchCaseStack.removeLast()
-                }
-
-                // Class semantic verification
-                if instr.op is EndClass {
-                    guard !classDefinitions.current.hasPendingMethods else {
-                        let pendingMethods = classDefinitions.current.pendingMethods().map({ $0.name })
-                        throw FuzzilliError.codeVerificationError("missing method definitions for methods \(pendingMethods) in class \(classDefinitions.current.name)")
-                    }
-                    classDefinitions.pop()
+                    defaultSwitchCaseStack.pop()
                 }
             }
 
@@ -253,29 +260,19 @@ public struct Code: Collection {
 
                 // Switch Case semantic verification
                 if instr.op is BeginSwitch {
-                    defaultSwitchCaseStack.append(false)
+                    defaultSwitchCaseStack.push(false)
                 }
 
                 // Ensure that we have at most one default case in a switch block
                 if instr.op is BeginSwitchDefaultCase {
-                    let stackTop = defaultSwitchCaseStack.removeLast()
+                    let stackTop = defaultSwitchCaseStack.pop()
 
                     // Check if the current block already has a default case
                     guard !stackTop else {
                         throw FuzzilliError.codeVerificationError("more than one default switch case defined")
                     }
 
-                    defaultSwitchCaseStack.append(true)
-                }
-
-                // Class semantic verification
-                if let op = instr.op as? BeginClass {
-                    classDefinitions.push(ClassDefinition(from: op, name: instr.output.identifier))
-                } else if instr.op is BeginMethod {
-                    guard classDefinitions.current.hasPendingMethods else {
-                        throw FuzzilliError.codeVerificationError("too many method definitions for class \(classDefinitions.current.name)")
-                    }
-                    let _ = classDefinitions.current.nextMethod()
+                    defaultSwitchCaseStack.push(true)
                 }
             }
 
@@ -297,7 +294,4 @@ public struct Code: Collection {
             return false
         }
     }
-
-    // This restriction arises from the fact that variables and instruction indices are stored internally as UInt16
-    public static let maxNumberOfVariables = 0x10000
 }

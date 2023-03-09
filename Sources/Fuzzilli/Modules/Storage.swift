@@ -63,6 +63,29 @@ public class Storage: Module {
             logger.fatal("Failed to create storage directories. Is \(storageDir) writable by the current user?")
         }
 
+        struct Settings: Codable {
+            var processArguments: [String]
+            var tag: String?
+        }
+
+        // Write the current settings to disk.
+        let settings = Settings(processArguments: Array(fuzzer.runner.processArguments[1...]), tag: fuzzer.config.tag)
+        var settingsData: Data?
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            settingsData = try encoder.encode(settings)
+        } catch {
+            logger.fatal("Failed to encode the settings data: \(error).")
+        }
+
+        do {
+            let settingsUrl = URL(fileURLWithPath: "\(self.storageDir)/settings.json")
+            try settingsData!.write(to: settingsUrl)
+        } catch {
+            logger.fatal("Failed to write settings to disk. Is \(storageDir) writable by the current user?")
+        }
+
         fuzzer.registerEventListener(for: fuzzer.events.CrashFound) { ev in
             let filename = "program_\(self.formatDate())_\(ev.program.id)_\(ev.behaviour.rawValue)"
             if ev.isUnique {
@@ -132,7 +155,7 @@ public class Storage: Module {
         // Also store the FuzzIL program in its protobuf format. This can later be imported again or inspected using the FuzzILTool
         do {
             let pb = try program.asProtobuf().serializedData()
-            let url = URL(fileURLWithPath: "\(directory)/\(filename).fuzzil.protobuf")
+            let url = URL(fileURLWithPath: "\(directory)/\(filename).fzil")
             createFile(url, withContent: pb)
         } catch {
             logger.warning("Failed to serialize program to protobuf: \(error)")
@@ -163,14 +186,18 @@ public class Storage: Module {
 
     private func saveStatistics(_ stats: Statistics) {
         let statsData = stats.compute()
+        let evaluatorStateData = fuzzer.evaluator.exportState()
 
         do {
-            let data = try statsData.jsonUTF8Data()
-            let url = URL(fileURLWithPath: "\(self.statisticsDir)/\(formatDate()).json")
-            try data.write(to: url)
+            let statsData = try statsData.jsonUTF8Data()
+            let date = formatDate()
+            let statsUrl = URL(fileURLWithPath: "\(self.statisticsDir)/\(date).json")
+            try statsData.write(to: statsUrl)
+            let evaluatorStateUrl = URL(fileURLWithPath: "\(self.statisticsDir)/\(date)_evaluator_state.bin")
+            try evaluatorStateData.write(to: evaluatorStateUrl)
 
         } catch {
-            logger.error("Failed to write statistics to disk: \(error)")
+            logger.error("Failed to write statistics or evaluator state data to disk: \(error)")
         }
     }
 

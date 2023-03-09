@@ -22,7 +22,7 @@ class AnalyzerTests: XCTestCase {
         let b = fuzzer.makeBuilder()
 
         for _ in 0..<10 {
-            b.build(n: 100, by: .runningGenerators)
+            b.build(n: 100, by: .generating)
             let program = b.finalize()
 
             var contextAnalyzer = ContextAnalyzer()
@@ -33,6 +33,32 @@ class AnalyzerTests: XCTestCase {
 
             XCTAssertEqual(contextAnalyzer.context, .javascript)
         }
+    }
+
+    func testObjectLiterals() {
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+
+        XCTAssertEqual(b.context, .javascript)
+        let v = b.loadInt(42)
+        b.buildObjectLiteral { obj in
+            XCTAssertEqual(b.context, .objectLiteral)
+            obj.addProperty("foo", as: v)
+            XCTAssertEqual(b.context, .objectLiteral)
+            obj.addMethod("bar", with: .parameters(n: 0)) { args in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method])
+            }
+            XCTAssertEqual(b.context, .objectLiteral)
+            obj.addGetter(for: "baz") { this in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method])
+            }
+            XCTAssertEqual(b.context, .objectLiteral)
+            obj.addSetter(for: "baz") { this, v in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method])
+            }
+            XCTAssertEqual(b.context, .objectLiteral)
+        }
+        XCTAssertEqual(b.context, .javascript)
     }
 
     func testNestedLoops() {
@@ -99,7 +125,7 @@ class AnalyzerTests: XCTestCase {
                 }
             }
             XCTAssertEqual(b.context, [.javascript, .with])
-            b.loadFromScope(id: b.genPropertyNameForRead())
+            b.loadNamedVariable(b.randomPropertyName())
         }
 
         let _ = b.finalize()
@@ -110,31 +136,57 @@ class AnalyzerTests: XCTestCase {
         let b = fuzzer.makeBuilder()
 
         XCTAssertEqual(b.context, .javascript)
-        let superclass = b.buildClass() { cls in
-            cls.defineConstructor(with: .parameters(n: 1)) { params in
-                XCTAssertEqual(b.context, [.javascript, .classDefinition, .subroutine])
+        let superclass = b.buildClassDefinition() { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { params in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
                 let loopVar1 = b.loadInt(0)
                 b.buildDoWhileLoop(loopVar1, .lessThan, b.loadInt(42)) {
-                    XCTAssertEqual(b.context, [.javascript, .classDefinition, .subroutine, .loop])
+                    XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod, .loop])
                 }
-                XCTAssertEqual(b.context, [.javascript, .classDefinition, .subroutine])
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
             }
         }
         XCTAssertEqual(b.context, .javascript)
 
-        b.buildClass(withSuperclass: superclass) { cls in
-            cls.defineConstructor(with: .parameters(n: 1)) { _ in
-                XCTAssertEqual(b.context, [.javascript, .classDefinition, .subroutine])
+        b.buildClassDefinition(withSuperclass: superclass) { cls in
+            cls.addConstructor(with: .parameters(n: 1)) { _ in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
                 let v0 = b.loadInt(42)
                 let v1 = b.createObject(with: ["foo": v0])
                 b.callSuperConstructor(withArgs: [v1])
             }
-            cls.defineMethod("classMethod", with: .parameters(n: 2)) { _ in
-                XCTAssertEqual(b.context, [.javascript, .classDefinition, .subroutine])
+            cls.addInstanceMethod("m", with: .parameters(n: 2)) { _ in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
                 b.buildAsyncFunction(with: .parameters(n: 2)) { _ in
                     XCTAssertEqual(b.context, [.javascript, .subroutine, .asyncFunction])
                 }
-                XCTAssertEqual(b.context, [.javascript, .classDefinition, .subroutine])
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
+            }
+            cls.addStaticMethod("m", with: .parameters(n: 2)) { _ in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
+            }
+
+            cls.addInstanceGetter(for: "foo") { this in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
+            }
+            cls.addInstanceSetter(for: "foo") { this, v in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
+            }
+            cls.addStaticGetter(for: "foo") { this in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
+            }
+            cls.addStaticSetter(for: "foo") { this, v in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
+            }
+            cls.addStaticInitializer { this in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
+            }
+
+            cls.addPrivateInstanceMethod("m", with: .parameters(n: 2)) { _ in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
+            }
+            cls.addPrivateStaticMethod("m", with: .parameters(n: 2)) { _ in
+                XCTAssertEqual(b.context, [.javascript, .subroutine, .method, .classMethod])
             }
         }
         XCTAssertEqual(b.context, .javascript)
@@ -206,19 +258,5 @@ class AnalyzerTests: XCTestCase {
         XCTAssertEqual(b.context, .javascript)
 
         let _  = b.finalize()
-    }
-}
-
-extension AnalyzerTests {
-    static var allTests : [(String, (AnalyzerTests) -> () throws -> Void)] {
-        return [
-            ("testContextAnalyzer", testContextAnalyzer),
-            ("testNestedLoops", testNestedLoops),
-            ("testNestedFunctions", testNestedFunctions),
-            ("testNestedWithStatements", testNestedWithStatements),
-            ("testClassDefinitions", testClassDefinitions),
-            ("testCodeStrings", testCodeStrings),
-            ("testContextPropagatingBlocks", testContextPropagatingBlocks)
-        ]
     }
 }

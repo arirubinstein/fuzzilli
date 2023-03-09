@@ -18,7 +18,7 @@ fileprivate let ForceDFGCompilationGenerator = CodeGenerator("ForceDFGCompilatio
     // The MutationEngine may use variables of unknown type as input as well, however, we only want to call functions that we generated ourselves. Further, attempting to call a non-function will result in a runtime exception.
     // For both these reasons, we abort here if we cannot prove that f is indeed a function.
     guard b.type(of: f).Is(.function()) else { return }
-    guard let arguments = b.randCallArguments(for: f) else { return }
+    guard let arguments = b.randomCallArguments(for: f) else { return }
 
     b.buildRepeat(n: 10) { _ in
         b.callFunction(f, withArgs: arguments)
@@ -27,7 +27,7 @@ fileprivate let ForceDFGCompilationGenerator = CodeGenerator("ForceDFGCompilatio
 
 fileprivate let ForceFTLCompilationGenerator = CodeGenerator("ForceFTLCompilationGenerator", input: .function()) { b, f in
     guard b.type(of: f).Is(.function()) else { return }
-    guard let arguments = b.randCallArguments(for: f) else { return }
+    guard let arguments = b.randomCallArguments(for: f) else { return }
 
     b.buildRepeat(n: 100) { _ in
         b.callFunction(f, withArgs: arguments)
@@ -35,7 +35,7 @@ fileprivate let ForceFTLCompilationGenerator = CodeGenerator("ForceFTLCompilatio
 }
 
 let jscProfile = Profile(
-    getProcessArguments: { (randomizingArguments: Bool) -> [String] in
+    processArgs: { randomize in
         var args = [
             "--validateOptions=true",
             // No need to call functions thousands of times before they are JIT compiled
@@ -50,7 +50,7 @@ let jscProfile = Profile(
             "--validateBCE=true",
             "--reprl"]
 
-        guard randomizingArguments else { return args }
+        guard randomize else { return args }
 
         args.append("--useBaselineJIT=\(probability(0.9) ? "true" : "false")")
         args.append("--useDFGJIT=\(probability(0.9) ? "true" : "false")")
@@ -74,15 +74,10 @@ let jscProfile = Profile(
     timeout: 250,
 
     codePrefix: """
-                function main() {
                 """,
 
     codeSuffix: """
                 gc();
-                }
-                noDFG(main);
-                noFTL(main);
-                main();
                 """,
 
     ecmaVersion: ECMAScriptVersion.es6,

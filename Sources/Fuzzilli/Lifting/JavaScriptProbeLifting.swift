@@ -15,6 +15,9 @@
 /// This file contains the JavaScript specific implementation of the Probe operation. See ProbingMutator.swift for an overview of this feature.
 struct JavaScriptProbeHelper {
     static let prefixCode = """
+    // If a sample with this instrumentation crashes, it may need the `fuzzilli` function to reproduce the crash.
+    if (typeof fuzzilli === 'undefined') fuzzilli = function() {};
+
     const Probe = (function() {
         // Note: this code must generally assume that any operation performed on the object to explore, or any object obtained through it (e.g. a prototype), may raise an exception, for example due to triggering a Proxy trap.
         // Further, it must also assume that the environment has been modified arbitrarily. For example, the Array.prototype[@@iterator] may have been set to an invalid value, so using `for...of` syntax could trigger an exception.
@@ -29,7 +32,7 @@ struct JavaScriptProbeHelper {
         const setPrototypeOf = Object.setPrototypeOf;
         const stringify = JSON.stringify;
         const parseInteger = parseInt;
-        const match = Function.prototype.call.bind(RegExp.prototype[Symbol.match]);
+        const execRegExp = Function.prototype.call.bind(RegExp.prototype.exec);
         const numberToString = Function.prototype.call.bind(Number.prototype.toString);
         const stringStartsWith = Function.prototype.call.bind(String.prototype.startsWith);
 
@@ -49,9 +52,10 @@ struct JavaScriptProbeHelper {
         //
         // Helper function to determine if a string is "simple". We only include simple strings for property/method names or string literals.
         // A simple string is basically a valid, property name with a maximum length.
+        const simpleStringRegExp = /^[0-9a-zA-Z_$]+$/;
         function isSimpleString(s) {
             if (typeof s !== 'string') return false;
-            return s.length < 50 && match(/^[0-9a-zA-Z_$]+$/, s);
+            return s.length < 50 && execRegExp(simpleStringRegExp, s) !== null;
         }
         // Helper function to determine if a string is numeric and its numeric value representable as an integer.
         function isNumericString(s) {

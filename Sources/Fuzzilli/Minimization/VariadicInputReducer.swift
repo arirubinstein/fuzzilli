@@ -26,56 +26,50 @@ struct VariadicInputReducer: Reducer {
                 guard instr.numInputs > instr.firstVariadicInput else { break }
 
                 let newOp: Operation
-                switch instr.op {
-                case let op as CreateObject:
-                    newOp = CreateObject(propertyNames: op.propertyNames.dropLast())
-                case let op as CreateArray:
+                switch instr.op.opcode {
+                case .createArray(let op):
                     newOp = CreateArray(numInitialValues: op.numInitialValues - 1)
-                case let op as CreateObjectWithSpread:
-                    if op.numSpreads > 0 {
-                        newOp = CreateObjectWithSpread(propertyNames: op.propertyNames, numSpreads: op.numSpreads - 1)
-                    } else {
-                        newOp = CreateObjectWithSpread(propertyNames: op.propertyNames.dropLast(), numSpreads: op.numSpreads)
-                    }
-                case let op as CreateArrayWithSpread:
+                case .createArrayWithSpread(let op):
                     newOp = CreateArrayWithSpread(spreads: op.spreads.dropLast())
-                case let op as CallFunction:
+                case .callFunction(let op):
                     newOp = CallFunction(numArguments: op.numArguments - 1)
-                case let op as CallFunctionWithSpread:
+                case .callFunctionWithSpread(let op):
                     if op.numArguments == 1 {
                         newOp = CallFunction(numArguments: 0)
                     } else {
                         newOp = CallFunctionWithSpread(numArguments: op.numArguments - 1, spreads: op.spreads.dropLast())
                     }
-                case let op as Construct:
+                case .construct(let op):
                     newOp = Construct(numArguments: op.numArguments - 1)
-                case let op as ConstructWithSpread:
+                case .constructWithSpread(let op):
                     if op.numArguments == 1 {
                         newOp = Construct(numArguments: 0)
                     } else {
                         newOp = ConstructWithSpread(numArguments: op.numArguments - 1, spreads: op.spreads.dropLast())
                     }
-                case let op as CallMethod:
+                case .callMethod(let op):
                     newOp = CallMethod(methodName: op.methodName, numArguments: op.numArguments - 1)
-                case let op as CallMethodWithSpread:
+                case .callMethodWithSpread(let op):
                     if op.numArguments == 1 {
                         newOp = CallMethod(methodName: op.methodName, numArguments: 0)
                     } else {
                         newOp = CallMethodWithSpread(methodName: op.methodName, numArguments: op.numArguments - 1, spreads: op.spreads.dropLast())
                     }
-                case let op as CallComputedMethod:
+                case .callComputedMethod(let op):
                     newOp = CallComputedMethod(numArguments: op.numArguments - 1)
-                case let op as CallComputedMethodWithSpread:
+                case .callComputedMethodWithSpread(let op):
                     if op.numArguments == 1 {
                         newOp = CallComputedMethod(numArguments: 0)
                     } else {
                         newOp = CallComputedMethodWithSpread(numArguments: op.numArguments - 1, spreads: op.spreads.dropLast())
                     }
-                case let op as CallSuperConstructor:
+                case .callSuperConstructor(let op):
                     newOp = CallSuperConstructor(numArguments: op.numArguments - 1)
-                case let op as CallSuperMethod:
+                case .callPrivateMethod(let op):
+                    newOp = CallPrivateMethod(methodName: op.methodName, numArguments: op.numArguments - 1)
+                case .callSuperMethod(let op):
                     newOp = CallSuperMethod(methodName: op.methodName, numArguments: op.numArguments - 1)
-                case let op as CreateTemplateString:
+                case .createTemplateString(let op):
                     newOp = CreateTemplateString(parts: op.parts.dropLast())
                 default:
                     fatalError("Unknown variadic operation \(instr.op)")

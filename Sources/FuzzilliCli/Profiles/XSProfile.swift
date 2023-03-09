@@ -87,7 +87,7 @@ fileprivate let CompartmentGenerator = RecursiveCodeGenerator("CompartmentGenera
 
 	if (Int.random(in: 0...100) < 50) {
 		options["globalLexicals"] = endowmentsObject
-		endowmentsObject = b.createObject(with: [:]) 
+		endowmentsObject = b.createObject(with: [:])
 	}
 	let optionsObject = b.createObject(with: options)
 
@@ -120,8 +120,8 @@ fileprivate let CompartmentEvaluateGenerator = CodeGenerator("CompartmentEvaluat
 */
 
 let xsProfile = Profile(
-    getProcessArguments: { (randomizingArguments: Bool) -> [String] in
-        return ["-f"]
+    processArgs: { randomize in
+        ["-f"]
     },
 
     processEnv: ["UBSAN_OPTIONS":"handle_segv=0"],
@@ -131,13 +131,9 @@ let xsProfile = Profile(
     timeout: 250,
 
     codePrefix: """
-                function placeholder(){}
-                function main() {
                 """,
 
     codeSuffix: """
-                }
-                main();
                 gc();
                 """,
 
