@@ -17,7 +17,8 @@ import Fuzzilli
 // swift run FuzzilliCli --profile=xs --jobs=4 --storagePath=./results --resume --inspect=history --timeout=600 $MODDABLE/build/bin/mac/debug/xst
 
 fileprivate let StressXSGC = CodeGenerator("StressXSGC", input: .function()) { b, f in
-    guard let arguments = b.randCallArguments(for: f) else { return }
+    guard b.type(of: f).Is(.function()) else { return }
+    guard let arguments = b.randomCallArguments(for: f) else { return }
 
     let index = b.loadInt(1)
     let end = b.loadInt(128)
@@ -60,8 +61,8 @@ fileprivate let CompartmentGenerator = RecursiveCodeGenerator("CompartmentGenera
 	var options = [String: Variable]()
 
 	for _ in 0..<Int.random(in: 1...4) {
-		let propertyName = b.genPropertyNameForWrite()
-		endowments[propertyName] = b.randVar()
+		let propertyName = b.randomCustomPropertyName()
+		endowments[propertyName] = b.randomVariable()
 	}
 	var endowmentsObject = b.createObject(with: endowments)
 
@@ -69,16 +70,16 @@ fileprivate let CompartmentGenerator = RecursiveCodeGenerator("CompartmentGenera
 	let moduleMapObject = b.createObject(with: moduleMap)
 	let resolveHook = b.buildPlainFunction(with: .parameters(n: 2)) { _ in
 		b.buildRecursive(block: 1, of: 4)
-		b.doReturn(b.randVar())
+		b.doReturn(b.randomVariable())
 	}
 	let moduleMapHook = b.buildPlainFunction(with: .parameters(n: 1)) { _ in
 		b.buildRecursive(block: 2, of: 4)
-		b.doReturn(b.randVar())
+		b.doReturn(b.randomVariable())
 	}
 	let loadNowHook = b.dup(moduleMapHook)
 	let loadHook = b.buildAsyncFunction(with: .parameters(n: 1)) { _ in
 		b.buildRecursive(block: 3, of: 4)
-		b.doReturn(b.randVar())
+		b.doReturn(b.randomVariable())
 	}
 	options["resolveHook"] = resolveHook;
 	options["moduleMapHook"] = moduleMapHook;
